@@ -17,7 +17,7 @@ MAX_TOTAL_MINUTES = 6 * 24 * 60 + 23 * 60 + 59  # 6d 23h 59m
 # Vendor model
 # ---------------------
 class Vendor:
-    def __init__(self, name, zone, council_left, last_reset, reset_maximum=0, categories=None):
+    def __init__(self, name, zone, council_left, last_reset, reset_maximum=0, categories=None, muted=False):
         self.name = name
         self.zone = zone
         self.council_left = int(council_left)
@@ -41,6 +41,7 @@ class Vendor:
 
         self.reset_maximum = int(reset_maximum)
         self.categories = categories or []
+        self.muted = bool(muted)  # New muted property
 
     def to_dict(self):
         return {
@@ -49,7 +50,8 @@ class Vendor:
             "council_left": int(self.council_left),
             "last_reset": self.last_reset.isoformat(),
             "reset_maximum": int(self.reset_maximum),
-            "categories": self.categories
+            "categories": self.categories,
+            "muted": self.muted  # Include muted in serialization
         }
 
     @staticmethod
@@ -60,12 +62,23 @@ class Vendor:
             d.get("council_left", 0),
             d.get("last_reset", datetime.now().isoformat()),
             d.get("reset_maximum", 0),
-            d.get("categories", [])
+            d.get("categories", []),
+            d.get("muted", False)  # Load muted property, default to False
         )
 
     @property
     def next_reset(self):
         return self.last_reset + timedelta(days=7)
+
+    @property
+    def is_ready_to_reset(self):
+        """Check if vendor is ready to reset (next reset time has passed)"""
+        return datetime.now() >= self.next_reset
+
+    @property
+    def is_empty(self):
+        """Check if vendor has no council left"""
+        return self.council_left == 0
 
 
 # ---------------------
@@ -225,6 +238,10 @@ class VendorApp(tk.Tk):
 
         self.vendors = load_vendors(self.current_character)
 
+        # Pulsing animation state
+        self.pulse_frame = 0
+        self.pulse_widgets = []  # List to track widgets that should pulse
+
         self.create_widgets()
         self.update_vendor_list()
         self.update_total_values()
@@ -232,6 +249,7 @@ class VendorApp(tk.Tk):
         # Start timer updates
         self.timer_running = True
         self.after(1000, self.update_timers)
+        self.after(100, self.update_pulse_animation)  # Pulse animation
 
     def create_widgets(self):
         # Top: character selection and filter
@@ -246,10 +264,16 @@ class VendorApp(tk.Tk):
 
         Button(top, text="Add New Character", command=self.add_new_character).pack(side=tk.LEFT, padx=6)
 
+        # Filter controls
         Label(top, text="Filter:").pack(side=tk.LEFT, padx=(12,4))
         self.filter_var = StringVar()
         self.filter_var.trace("w", lambda *a: self.update_vendor_list())
         Entry(top, textvariable=self.filter_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+
+        # Show muted checkbox
+        self.show_muted_var = BooleanVar(value=False)
+        self.show_muted_var.trace("w", lambda *a: self.update_vendor_list())
+        Checkbutton(top, text="Show Muted", variable=self.show_muted_var).pack(side=tk.LEFT, padx=6)
 
         # Info bar
         info = tk.Frame(self, bg="lightgrey", relief="raised", bd=1)
@@ -357,12 +381,46 @@ class VendorApp(tk.Tk):
 
     def update_total_values(self):
         try:
-            total_council = sum(v.council_left for v in self.vendors)
-            total_maximum = sum(v.reset_maximum for v in self.vendors)
+            # Only count unmuted vendors for totals
+            unmuted_vendors = [v for v in self.vendors if not v.muted]
+            total_council = sum(v.council_left for v in unmuted_vendors)
+            total_maximum = sum(v.reset_maximum for v in unmuted_vendors)
             self.total_council_label.config(text=f"Current Vendor Council Pool: {format_number(total_council)}")
             self.total_max_label.config(text=f"Total Vendor Cash: {format_number(total_maximum)}")
         except Exception as e:
             print(f"Error updating total values: {e}")
+
+    def update_pulse_animation(self):
+        """Update pulsing animation for vendors that are both empty and ready to reset"""
+        if not self.timer_running:
+            return
+            
+        try:
+            self.pulse_frame = (self.pulse_frame + 1) % 60  # 60 frames = ~6 seconds cycle
+            
+            # Calculate pulse color between yellow and green
+            pulse_ratio = (1 + __import__('math').sin(self.pulse_frame * 0.2)) / 2  # 0 to 1
+            
+            # Interpolate between yellow (255,255,0) and green (144,238,144)
+            r = int(255 - (255 - 144) * pulse_ratio)
+            g = int(255 - (255 - 238) * pulse_ratio)
+            b = int(0 + 144 * pulse_ratio)
+            
+            pulse_color = f"#{r:02x}{g:02x}{b:02x}"
+            
+            # Update all pulsing widgets
+            for widget in self.pulse_widgets:
+                if widget.winfo_exists():
+                    try:
+                        widget.config(bg=pulse_color)
+                    except:
+                        pass  # Widget might not support bg config
+                        
+        except Exception as e:
+            print(f"Error updating pulse animation: {e}")
+        
+        # Schedule next frame
+        self.after(100, self.update_pulse_animation)
 
     def update_timers(self):
         if not self.timer_running:
@@ -385,9 +443,14 @@ class VendorApp(tk.Tk):
                             time_str = "RESET PENDING!"
                         widget.time_label.config(text=f"Time until reset: {time_str}")
 
-            # Global next reset
-            if self.vendors:
-                next_reset = min(v.next_reset for v in self.vendors)
+            # Global next reset - only count unmuted vendors that are ready to reset
+            unmuted_vendors = [v for v in self.vendors if not v.muted]
+            ready_vendors = [v for v in unmuted_vendors if v.is_ready_to_reset]
+            
+            if ready_vendors:
+                self.next_reset_label.config(text=f"Ready to reset: {len(ready_vendors)} vendor(s)")
+            elif unmuted_vendors:
+                next_reset = min(v.next_reset for v in unmuted_vendors)
                 td = next_reset - datetime.now()
                 if td.total_seconds() > 0:
                     days = td.days
@@ -425,13 +488,21 @@ class VendorApp(tk.Tk):
 
     def update_vendor_list(self):
         try:
-            # Clear existing widgets
+            # Clear existing widgets and pulse list
             for w in self.scrollable_frame.winfo_children():
                 w.destroy()
+            self.pulse_widgets = []
 
             query = self.filter_var.get().lower().strip()
+            show_muted = self.show_muted_var.get()
+            
             filtered = []
             for v in self.vendors:
+                # Filter by muted status
+                if v.muted and not show_muted:
+                    continue
+                    
+                # Filter by search query
                 blob = f"{v.name} {v.zone} {' '.join(v.categories)}".lower()
                 if query in blob:
                     filtered.append(v)
@@ -450,10 +521,16 @@ class VendorApp(tk.Tk):
 
                 for vendor in cluster:
                     bg = "SystemButtonFace"
-                    if vendor.council_left == 0:
-                        bg = "#D3D3D3"
-                    elif (vendor.next_reset - datetime.now()).total_seconds() <= 0:
-                        bg = "#90EE90"
+                    should_pulse = False
+                    
+                    # Determine background color and pulsing
+                    if vendor.is_empty and vendor.is_ready_to_reset:
+                        should_pulse = True
+                        bg = "#FFFF00"  # Start with yellow for pulsing
+                    elif vendor.is_empty:
+                        bg = "#D3D3D3"  # Gray for empty
+                    elif vendor.is_ready_to_reset:
+                        bg = "#90EE90"  # Green for ready to reset
 
                     parent = tk.Frame(self.scrollable_frame, bg=border_color or "", bd=5 if border_color else 0)
                     parent.pack(fill=tk.X, pady=5)
@@ -462,29 +539,82 @@ class VendorApp(tk.Tk):
                     vf = tk.Frame(parent, bd=2, relief="groove", padx=5, pady=5, bg=bg)
                     vf.pack(fill=tk.X, expand=True)
 
+                    # Add to pulse list if needed
+                    if should_pulse:
+                        self.pulse_widgets.append(vf)
+
                     info = tk.Frame(vf, bg=bg)
                     info.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                    if should_pulse:
+                        self.pulse_widgets.append(info)
 
-                    Label(info, text=f"{vendor.name} ({vendor.zone})", font=("Helvetica", 12, "bold"), bg=bg).pack(anchor="w")
-                    Label(info, text=f"Council left: {format_number(vendor.council_left)}", bg=bg).pack(anchor="w")
+                    # Vendor name with muted indicator
+                    name_text = f"{vendor.name} ({vendor.zone})"
+                    if vendor.muted:
+                        name_text += " [MUTED]"
+                    name_label = Label(info, text=name_text, font=("Helvetica", 12, "bold"), bg=bg)
+                    name_label.pack(anchor="w")
+                    if should_pulse:
+                        self.pulse_widgets.append(name_label)
+
+                    council_label = Label(info, text=f"Council left: {format_number(vendor.council_left)}", bg=bg)
+                    council_label.pack(anchor="w")
+                    if should_pulse:
+                        self.pulse_widgets.append(council_label)
+                        
                     if vendor.reset_maximum > 0:
-                        Label(info, text=f"Reset maximum: {format_number(vendor.reset_maximum)}", bg=bg).pack(anchor="w")
+                        max_label = Label(info, text=f"Reset maximum: {format_number(vendor.reset_maximum)}", bg=bg)
+                        max_label.pack(anchor="w")
+                        if should_pulse:
+                            self.pulse_widgets.append(max_label)
+                            
                     if vendor.categories:
-                        Label(info, text="Categories: " + ", ".join(vendor.categories), bg=bg).pack(anchor="w")
+                        cat_label = Label(info, text="Categories: " + ", ".join(vendor.categories), bg=bg)
+                        cat_label.pack(anchor="w")
+                        if should_pulse:
+                            self.pulse_widgets.append(cat_label)
 
                     time_label = Label(info, text="", fg="red", bg=bg)
                     time_label.pack(anchor="w")
+                    if should_pulse:
+                        self.pulse_widgets.append(time_label)
 
                     # Attach time_label to parent so update_timers can find it
                     parent.time_label = time_label
 
                     btns = tk.Frame(vf, bg=bg)
                     btns.pack(side=tk.RIGHT)
+                    if should_pulse:
+                        self.pulse_widgets.append(btns)
+                        
                     Button(btns, text="Update", command=lambda v=vendor: self.open_update_vendor_window(v)).pack(padx=5, pady=2)
                     Button(btns, text="Delete", command=lambda v=vendor: self.delete_vendor(v)).pack(padx=5, pady=2)
+                    
+                    # Mute/Unmute button
+                    mute_text = "Unmute" if vendor.muted else "Mute"
+                    Button(btns, text=mute_text, command=lambda v=vendor: self.toggle_mute_vendor(v)).pack(padx=5, pady=2)
+
+            # Update scroll region after adding all widgets
+            self.canvas.update_idletasks()
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+                        
         except Exception as e:
             print(f"Error updating vendor list: {e}")
             messagebox.showerror("Error", f"Could not update vendor list: {e}")
+
+    def toggle_mute_vendor(self, vendor):
+        """Toggle mute status of a vendor"""
+        try:
+            vendor.muted = not vendor.muted
+            save_vendors(self.vendors, self.current_character)
+            self.update_vendor_list()
+            self.update_total_values()
+            
+            status = "muted" if vendor.muted else "unmuted"
+            messagebox.showinfo("Success", f"{vendor.name} has been {status}.", parent=self)
+        except Exception as e:
+            print(f"Error toggling mute for vendor: {e}")
+            messagebox.showerror("Error", f"Could not toggle mute for vendor: {e}")
 
     def delete_vendor(self, vendor_to_delete):
         try:
@@ -536,11 +666,15 @@ class VendorApp(tk.Tk):
         cat_override_row = tk.Frame(add_window)
         cat_override_row.pack(padx=10, pady=6, anchor="w", fill=tk.X)
 
-        # Override on the left
+        # Override and muted on the left
+        left_options = tk.Frame(cat_override_row)
+        left_options.pack(side=tk.LEFT, padx=(0,12), anchor="n")
+        
         max_time_override_var = BooleanVar(value=False)
-        override_frame = tk.Frame(cat_override_row)
-        override_frame.pack(side=tk.LEFT, padx=(0,12), anchor="n")
-        Checkbutton(override_frame, text="Max-Time-Override", variable=max_time_override_var).pack(anchor="n")
+        Checkbutton(left_options, text="Max-Time-Override", variable=max_time_override_var).pack(anchor="w")
+        
+        muted_var = BooleanVar(value=False)
+        Checkbutton(left_options, text="Start Muted", variable=muted_var).pack(anchor="w")
 
         # Categories area
         cat_area_frame = tk.Frame(cat_override_row)
@@ -601,6 +735,7 @@ class VendorApp(tk.Tk):
                 d, h, m = _clamp_reset_inputs(d_raw, h_raw, m_raw, override_flag)
                 last_reset = calculate_last_reset(d, h, m, override_flag)
                 reset_maximum = council
+                is_muted = muted_var.get()
 
                 selected_cats = [c for c, var in cat_vars.items() if var.get()]
                 if custom_var.get():
@@ -616,7 +751,7 @@ class VendorApp(tk.Tk):
                         seen.add(c)
                         final_cats.append(c)
 
-                new_vendor = Vendor(name, zone, council, last_reset, reset_maximum, final_cats)
+                new_vendor = Vendor(name, zone, council, last_reset, reset_maximum, final_cats, is_muted)
                 self.vendors.append(new_vendor)
                 save_vendors(self.vendors, self.current_character)
                 self.update_vendor_list()
@@ -638,7 +773,7 @@ class VendorApp(tk.Tk):
     def open_update_vendor_window(self, vendor):
         update_window = Toplevel(self)
         update_window.title(f"Update {vendor.name}")
-        update_window.geometry("640x360")
+        update_window.geometry("640x400")
 
         Label(update_window, text=f"Updating {vendor.name} ({vendor.zone})").pack(padx=10, pady=(8,2), anchor="w")
 
@@ -677,10 +812,15 @@ class VendorApp(tk.Tk):
         cat_override_row = tk.Frame(update_window)
         cat_override_row.pack(padx=10, pady=6, anchor="w", fill=tk.X)
 
+        # Override and muted options
+        left_options = tk.Frame(cat_override_row)
+        left_options.pack(side=tk.LEFT, padx=(0,12), anchor="n")
+        
         max_time_override_var = BooleanVar(value=False)
-        override_frame = tk.Frame(cat_override_row)
-        override_frame.pack(side=tk.LEFT, padx=(0,12), anchor="n")
-        Checkbutton(override_frame, text="Max-Time-Override", variable=max_time_override_var).pack(anchor="n")
+        Checkbutton(left_options, text="Max-Time-Override", variable=max_time_override_var).pack(anchor="w")
+        
+        muted_var = BooleanVar(value=vendor.muted)
+        Checkbutton(left_options, text="Muted", variable=muted_var).pack(anchor="w")
 
         cat_area_frame = tk.Frame(cat_override_row)
         cat_area_frame.pack(side=tk.LEFT, anchor="n")
@@ -723,7 +863,23 @@ class VendorApp(tk.Tk):
                     self.update_vendor_list()
                     self.update_total_values()
                     messagebox.showinfo("Success", f"Vendor '{vendor.name}' has been reset.", parent=update_window)
-                    update_window.destroy()
+                    # Don't close the window - just update the time fields
+                    time_diff = vendor.next_reset - datetime.now()
+                    new_days = max(0, time_diff.days)
+                    new_hours = max(0, time_diff.seconds // 3600)
+                    new_minutes = max(0, (time_diff.seconds % 3600) // 60)
+                    
+                    days_entry.delete(0, tk.END)
+                    days_entry.insert(0, str(new_days))
+                    hours_entry.delete(0, tk.END)
+                    hours_entry.insert(0, str(new_hours))
+                    minutes_entry.delete(0, tk.END)
+                    minutes_entry.insert(0, str(new_minutes))
+                    
+                    # Update council display
+                    council_entry.delete(0, tk.END)
+                    council_entry.insert(0, str(vendor.council_left // 1000))
+                    
             except Exception as e:
                 print(f"Error resetting vendor: {e}")
                 messagebox.showerror("Error", f"Could not reset vendor: {e}", parent=update_window)
@@ -757,6 +913,7 @@ class VendorApp(tk.Tk):
                 if new_council > vendor.reset_maximum:
                     vendor.reset_maximum = new_council
                 vendor.last_reset = calculate_last_reset(d, h, m, override_flag)
+                vendor.muted = muted_var.get()
 
                 selected_cats = [c for c, var in cat_vars.items() if var.get()]
                 if custom_var.get():
@@ -787,6 +944,8 @@ class VendorApp(tk.Tk):
         reset_button.pack(side=tk.LEFT, padx=6)
         update_button = Button(button_line, text="Update", command=update_vendor_action)
         update_button.pack(side=tk.RIGHT, padx=6)
+        close_button = Button(button_line, text="Close", command=update_window.destroy)
+        close_button.pack(side=tk.RIGHT)
 
     def on_closing(self):
         """Handle application closing."""
