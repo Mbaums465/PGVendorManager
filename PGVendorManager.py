@@ -1,17 +1,99 @@
 import tkinter as tk
 from tkinter import messagebox, Toplevel, Label, Entry, Button, Scrollbar, Canvas, OptionMenu, StringVar, simpledialog, Checkbutton, BooleanVar
+import sqlite3
 import json
 from datetime import datetime, timedelta
 import os
 import sys
+import time
 
 # ---------------------
 # Configuration
 # ---------------------
-# Use absolute path to avoid issues when running from different directories
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'character_data')
+DATABASE_PATH = os.path.join(DATA_DIR, 'vendors.db')
 DEFAULT_CHARACTER = 'Default'
 MAX_TOTAL_MINUTES = 6 * 24 * 60 + 23 * 60 + 59  # 6d 23h 59m
+
+# ---------------------
+# Database Setup
+# ---------------------
+def _ensure_data_dir():
+    try:
+        if not os.path.exists(DATA_DIR):
+            os.makedirs(DATA_DIR)
+    except OSError as e:
+        print(f"Error creating data directory: {e}")
+        messagebox.showerror("Error", f"Could not create data directory: {e}")
+
+def init_database():
+    """Initialize SQLite database and create vendors table if it doesn't exist."""
+    _ensure_data_dir()
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS vendors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    character_name TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    zone TEXT NOT NULL,
+                    council_left INTEGER NOT NULL,
+                    last_reset TEXT NOT NULL,
+                    reset_maximum INTEGER NOT NULL,
+                    categories TEXT NOT NULL,
+                    muted BOOLEAN NOT NULL,
+                    UNIQUE(character_name, name)
+                )
+            ''')
+            conn.commit()
+    except sqlite3.Error as e:
+        print(f"Error initializing database: {e}")
+        messagebox.showerror("Error", f"Could not initialize database: {e}")
+
+def migrate_json_to_sqlite():
+    """Migrate existing JSON files to SQLite database."""
+    _ensure_data_dir()
+    try:
+        files = [f for f in os.listdir(DATA_DIR) if f.endswith('_vendors.json')]
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            for json_file in files:
+                character_name = json_file.replace('_vendors.json', '')
+                file_path = os.path.join(DATA_DIR, json_file)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            for vendor_data in data:
+                                cursor.execute('''
+                                    INSERT OR REPLACE INTO vendors (
+                                        character_name, name, zone, council_left,
+                                        last_reset, reset_maximum, categories, muted
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                ''', (
+                                    character_name,
+                                    vendor_data.get("name", ""),
+                                    vendor_data.get("zone", ""),
+                                    int(vendor_data.get("council_left", 0)),
+                                    vendor_data.get("last_reset", datetime.now().isoformat()),
+                                    int(vendor_data.get("reset_maximum", 0)),
+                                    json.dumps(vendor_data.get("categories", [])),
+                                    bool(vendor_data.get("muted", False))
+                                ))
+                    conn.commit()
+                    # Rename with timestamp to avoid conflicts
+                    backup_path = file_path + f'.backup_{int(time.time())}'
+                    os.rename(file_path, backup_path)
+                    print(f"Migrated {json_file} to SQLite and renamed to {os.path.basename(backup_path)}")
+                except (json.JSONDecodeError, IOError, sqlite3.Error) as e:
+                    print(f"Error migrating {json_file}: {e}")
+                    # No messagebox to avoid pop-ups
+                except OSError as e:
+                    print(f"Error renaming {json_file}: {e}")
+                    # No messagebox
+    except OSError as e:
+        print(f"Error accessing data directory: {e}")
 
 # ---------------------
 # Vendor model
@@ -22,13 +104,11 @@ class Vendor:
         self.zone = zone
         self.council_left = int(council_left)
         
-        # Improved last_reset parsing with better error handling
         if isinstance(last_reset, str):
             try:
                 self.last_reset = datetime.fromisoformat(last_reset)
             except ValueError:
                 try:
-                    # fallback: if it's stored as timestamp string
                     self.last_reset = datetime.fromtimestamp(float(last_reset))
                 except (ValueError, OverflowError):
                     print(f"Warning: Invalid last_reset format for {name}, using current time")
@@ -41,7 +121,7 @@ class Vendor:
 
         self.reset_maximum = int(reset_maximum)
         self.categories = categories or []
-        self.muted = bool(muted)  # New muted property
+        self.muted = bool(muted)
 
     def to_dict(self):
         return {
@@ -51,7 +131,7 @@ class Vendor:
             "last_reset": self.last_reset.isoformat(),
             "reset_maximum": int(self.reset_maximum),
             "categories": self.categories,
-            "muted": self.muted  # Include muted in serialization
+            "muted": self.muted
         }
 
     @staticmethod
@@ -63,7 +143,7 @@ class Vendor:
             d.get("last_reset", datetime.now().isoformat()),
             d.get("reset_maximum", 0),
             d.get("categories", []),
-            d.get("muted", False)  # Load muted property, default to False
+            d.get("muted", False)
         )
 
     @property
@@ -72,91 +152,83 @@ class Vendor:
 
     @property
     def is_ready_to_reset(self):
-        """Check if vendor is ready to reset (next reset time has passed)"""
         return datetime.now() >= self.next_reset
 
     @property
     def is_empty(self):
-        """Check if vendor has no council left"""
         return self.council_left == 0
-
 
 # ---------------------
 # Persistence
 # ---------------------
-def _ensure_data_dir():
-    try:
-        if not os.path.exists(DATA_DIR):
-            os.makedirs(DATA_DIR)
-    except OSError as e:
-        print(f"Error creating data directory: {e}")
-        messagebox.showerror("Error", f"Could not create data directory: {e}")
-
-def character_file_path(character_name):
-    # Sanitize filename to prevent path issues
-    safe_name = "".join(c for c in character_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
-    return os.path.join(DATA_DIR, f"{safe_name}_vendors.json")
-
 def save_vendors(vendors, character_name):
-    """Save vendors for character_name. Keep format as a list (backwards-compatible)."""
+    """Save vendors for character_name to SQLite."""
     try:
-        _ensure_data_dir()
-        file_path = character_file_path(character_name)
-        vendor_list = [v.to_dict() for v in vendors]
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(vendor_list, f, indent=4, ensure_ascii=False)
-    except (OSError, IOError) as e:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM vendors WHERE character_name = ?', (character_name,))
+            for vendor in vendors:
+                cursor.execute('''
+                    INSERT INTO vendors (
+                        character_name, name, zone, council_left,
+                        last_reset, reset_maximum, categories, muted
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    character_name,
+                    vendor.name,
+                    vendor.zone,
+                    vendor.council_left,
+                    vendor.last_reset.isoformat(),
+                    vendor.reset_maximum,
+                    json.dumps(vendor.categories),
+                    vendor.muted
+                ))
+            conn.commit()
+    except sqlite3.Error as e:
         print(f"Error saving vendors: {e}")
         messagebox.showerror("Error", f"Could not save vendors: {e}")
 
 def load_vendors(character_name):
-    """
-    Load vendors for character_name with improved error handling.
-    """
-    _ensure_data_dir()
-    file_path = character_file_path(character_name)
-    
-    if not os.path.exists(file_path):
-        return []
-    
+    """Load vendors for character_name from SQLite."""
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            
-        # if file is a list of dicts
-        if isinstance(data, list):
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT name, zone, council_left, last_reset, reset_maximum, categories, muted FROM vendors WHERE character_name = ?', (character_name,))
+            rows = cursor.fetchall()
             vendors = []
-            for vendor_data in data:
+            for row in rows:
                 try:
-                    vendors.append(Vendor.from_dict(vendor_data))
-                except Exception as e:
-                    print(f"Error loading vendor {vendor_data.get('name', 'Unknown')}: {e}")
+                    vendor = Vendor(
+                        name=row[0],
+                        zone=row[1],
+                        council_left=row[2],
+                        last_reset=row[3],
+                        reset_maximum=row[4],
+                        categories=json.loads(row[5]),
+                        muted=row[6]
+                    )
+                    vendors.append(vendor)
+                except (ValueError, json.JSONDecodeError) as e:
+                    print(f"Error loading vendor {row[0]}: {e}")
             return vendors
-            
-        # if file is a dict with "vendors"
-        if isinstance(data, dict):
-            vendors_blob = data.get("vendors") or data.get("vendor_list") or []
-            if isinstance(vendors_blob, list):
-                vendors = []
-                for vendor_data in vendors_blob:
-                    try:
-                        vendors.append(Vendor.from_dict(vendor_data))
-                    except Exception as e:
-                        print(f"Error loading vendor {vendor_data.get('name', 'Unknown')}: {e}")
-                return vendors
-        
-        print(f"Warning: Unexpected file format in {file_path}")
-        return []
-        
-    except json.JSONDecodeError as e:
-        print(f"Error parsing JSON file {file_path}: {e}")
-        messagebox.showerror("Error", f"Could not parse vendor file for {character_name}: {e}")
-        return []
-    except (OSError, IOError) as e:
-        print(f"Error reading file {file_path}: {e}")
-        messagebox.showerror("Error", f"Could not read vendor file for {character_name}: {e}")
+    except sqlite3.Error as e:
+        print(f"Error loading vendors: {e}")
+        messagebox.showerror("Error", f"Could not load vendors for {character_name}: {e}")
         return []
 
+def get_all_characters():
+    """Retrieve all unique character names from the database."""
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT DISTINCT character_name FROM vendors')
+            characters = [row[0] for row in cursor.fetchall()]
+            if DEFAULT_CHARACTER not in characters:
+                characters.append(DEFAULT_CHARACTER)
+            return sorted(characters)
+    except sqlite3.Error as e:
+        print(f"Error fetching characters: {e}")
+        return [DEFAULT_CHARACTER]
 
 # ---------------------
 # Helpers
@@ -177,7 +249,6 @@ def format_number(value):
         return str(value)
 
 def _clamp_reset_inputs(days, hours, minutes, override_max_time=False):
-    """Clamp user inputs to reasonable bounds. If not override, clamp to <= 6d 23h 59m."""
     try:
         d = max(0, int(days or 0))
         h = max(0, int(hours or 0))
@@ -192,23 +263,18 @@ def _clamp_reset_inputs(days, hours, minutes, override_max_time=False):
         d, remainder = divmod(total_minutes, 24 * 60)
         h, m = divmod(remainder, 60)
     else:
-        # still keep hours/minutes in normal ranges
         h = min(h, 23)
         m = min(m, 59)
     return int(d), int(h), int(m)
 
 def calculate_last_reset(days, hours, minutes, override_max_time=False):
-    """Return the last_reset datetime given time until next reset (d,h,m)."""
     d, h, m = _clamp_reset_inputs(days, hours, minutes, override_max_time)
     time_until_reset = timedelta(days=d, hours=h, minutes=m)
     if not override_max_time:
-        # "time since last reset" = 7 days - time_until_reset
         time_since_last_reset = timedelta(days=7) - time_until_reset
         return datetime.now() - time_since_last_reset
     else:
-        # allow >7d and compute accordingly
         return datetime.now() + time_until_reset - timedelta(days=7)
-
 
 # ---------------------
 # GUI Application
@@ -219,40 +285,35 @@ class VendorApp(tk.Tk):
         self.title("Vendor Reset Manager")
         self.geometry("900x600")
 
+        # Initialize database
+        init_database()
+        migrate_json_to_sqlite()
+
         # Initialize vendors list
         self.vendors = []
         
-        # Load characters with error handling
-        try:
-            _ensure_data_dir()
-            files = [f for f in os.listdir(DATA_DIR) if f.endswith('_vendors.json')]
-            self.characters = sorted(list({f.replace('_vendors.json', '') for f in files}))
-        except OSError:
-            self.characters = []
-            
-        if DEFAULT_CHARACTER not in self.characters:
-            self.characters.insert(0, DEFAULT_CHARACTER)
-        if not self.characters:
-            self.characters = [DEFAULT_CHARACTER]
-        self.current_character = self.characters[0]
+        # Load characters
+        self.characters = get_all_characters()
+        self.current_character = self.characters[0] if self.characters else DEFAULT_CHARACTER
 
         self.vendors = load_vendors(self.current_character)
 
         # Pulsing animation state
         self.pulse_frame = 0
-        self.pulse_widgets = []  # List to track widgets that should pulse
+        self.pulse_widgets = []
+
+        # Flashing state for "RESET PENDING!"
+        self.flash_phase = False
 
         self.create_widgets()
         self.update_vendor_list()
         self.update_total_values()
         
-        # Start timer updates
         self.timer_running = True
         self.after(1000, self.update_timers)
-        self.after(100, self.update_pulse_animation)  # Pulse animation
+        self.after(100, self.update_pulse_animation)
 
     def create_widgets(self):
-        # Top: character selection and filter
         top = tk.Frame(self)
         top.pack(fill=tk.X, padx=8, pady=6)
 
@@ -264,18 +325,15 @@ class VendorApp(tk.Tk):
 
         Button(top, text="Add New Character", command=self.add_new_character).pack(side=tk.LEFT, padx=6)
 
-        # Filter controls
         Label(top, text="Filter:").pack(side=tk.LEFT, padx=(12,4))
         self.filter_var = StringVar()
         self.filter_var.trace("w", lambda *a: self.update_vendor_list())
         Entry(top, textvariable=self.filter_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
 
-        # Show muted checkbox
         self.show_muted_var = BooleanVar(value=False)
         self.show_muted_var.trace("w", lambda *a: self.update_vendor_list())
         Checkbutton(top, text="Show Muted", variable=self.show_muted_var).pack(side=tk.LEFT, padx=6)
 
-        # Info bar
         info = tk.Frame(self, bg="lightgrey", relief="raised", bd=1)
         info.pack(fill=tk.X, padx=8, pady=6)
         self.total_council_label = Label(info, text="Current Vendor Council Pool: 0K", bg="lightgrey")
@@ -285,12 +343,10 @@ class VendorApp(tk.Tk):
         self.next_reset_label = Label(info, text="Time until next reset: --", bg="lightgrey")
         self.next_reset_label.pack(side=tk.LEFT, padx=8, pady=6)
 
-        # Buttons
         btns = tk.Frame(self)
         btns.pack(fill=tk.X, padx=8, pady=4)
         Button(btns, text="Add New Vendor", command=self.open_add_vendor_window).pack(side=tk.LEFT, padx=4)
 
-        # Vendor list with scrolling
         self.vendor_frame = tk.Frame(self)
         self.vendor_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
@@ -309,13 +365,10 @@ class VendorApp(tk.Tk):
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
 
-        # Improved mouse wheel binding for cross-platform compatibility
         def _on_mousewheel(event):
             try:
-                # Windows
                 if hasattr(event, 'delta'):
                     self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-                # Linux
                 elif event.num == 4:
                     self.canvas.yview_scroll(-1, "units")
                 elif event.num == 5:
@@ -323,10 +376,9 @@ class VendorApp(tk.Tk):
             except Exception as e:
                 print(f"Mouse wheel error: {e}")
         
-        # Bind for different platforms
-        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)  # Windows
-        self.canvas.bind_all("<Button-4>", _on_mousewheel)    # Linux
-        self.canvas.bind_all("<Button-5>", _on_mousewheel)    # Linux
+        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self.canvas.bind_all("<Button-4>", _on_mousewheel)
+        self.canvas.bind_all("<Button-5>", _on_mousewheel)
 
     def on_char_change(self, *args):
         try:
@@ -346,7 +398,6 @@ class VendorApp(tk.Tk):
             messagebox.showerror("Error", "Character name cannot be empty.", parent=self)
             return
         
-        # More flexible character name validation
         safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
         if not safe_name:
             messagebox.showerror("Error", "Character name must contain alphanumeric characters.", parent=self)
@@ -361,14 +412,9 @@ class VendorApp(tk.Tk):
         self.char_var.set(safe_name)
         self.update_char_menu()
         
-        # If Default existed, copy default vendors into new char
-        default_path = character_file_path(DEFAULT_CHARACTER)
-        if os.path.exists(default_path):
-            try:
-                default_vendors = load_vendors(DEFAULT_CHARACTER)
-                save_vendors(default_vendors, safe_name)
-            except Exception as e:
-                print(f"Error copying default vendors: {e}")
+        default_vendors = load_vendors(DEFAULT_CHARACTER)
+        if default_vendors:
+            save_vendors(default_vendors, safe_name)
 
     def update_char_menu(self):
         try:
@@ -381,7 +427,6 @@ class VendorApp(tk.Tk):
 
     def update_total_values(self):
         try:
-            # Only count unmuted vendors for totals
             unmuted_vendors = [v for v in self.vendors if not v.muted]
             total_council = sum(v.council_left for v in unmuted_vendors)
             total_maximum = sum(v.reset_maximum for v in unmuted_vendors)
@@ -391,25 +436,18 @@ class VendorApp(tk.Tk):
             print(f"Error updating total values: {e}")
 
     def update_pulse_animation(self):
-        """Update pulsing animation for vendors that are both empty and ready to reset"""
         if not self.timer_running:
             return
             
         try:
-            self.pulse_frame = (self.pulse_frame + 1) % 120  # 120 frames = ~12 seconds cycle for slower pulse
-            
-            # Calculate pulse color between yellow and green using a smoother sine wave
+            self.pulse_frame = (self.pulse_frame + 1) % 120
             import math
-            pulse_ratio = (1 + math.sin(self.pulse_frame * math.pi / 30)) / 2  # 0 to 1, slower cycle
-            
-            # Interpolate between bright yellow (255,255,0) and bright green (50,205,50)
+            pulse_ratio = (1 + math.sin(self.pulse_frame * math.pi / 30)) / 2
             r = int(255 - (255 - 50) * pulse_ratio)
-            g = int(255 - (255 - 205) * pulse_ratio)  
+            g = int(255 - (255 - 205) * pulse_ratio)
             b = int(0 + 50 * pulse_ratio)
-            
             pulse_color = f"#{r:02x}{g:02x}{b:02x}"
             
-            # Update all pulsing widgets
             widgets_to_remove = []
             for widget_info in self.pulse_widgets:
                 widget = widget_info['widget']
@@ -424,14 +462,12 @@ class VendorApp(tk.Tk):
                     print(f"Error updating widget color: {e}")
                     widgets_to_remove.append(widget_info)
             
-            # Clean up destroyed widgets
             for widget_info in widgets_to_remove:
                 self.pulse_widgets.remove(widget_info)
                         
         except Exception as e:
             print(f"Error updating pulse animation: {e}")
         
-        # Schedule next frame
         self.after(100, self.update_pulse_animation)
 
     def update_timers(self):
@@ -439,172 +475,140 @@ class VendorApp(tk.Tk):
             return
             
         try:
-            # Update each vendor's time label if present
+            now = datetime.now()
             for widget in self.scrollable_frame.winfo_children():
-                if hasattr(widget, 'vendor_name') and hasattr(widget, 'time_label'):
+                if hasattr(widget, 'time_label') and widget.time_label.winfo_exists():
                     vname = widget.vendor_name
                     vendor = next((x for x in self.vendors if x.name == vname), None)
-                    if vendor and widget.time_label.winfo_exists():
-                        time_diff = vendor.next_reset - datetime.now()
+                    if vendor:
+                        time_diff = vendor.next_reset - now
                         if time_diff.total_seconds() > 0:
                             days = time_diff.days
                             hours = time_diff.seconds // 3600
                             minutes = (time_diff.seconds % 3600) // 60
-                            time_str = f"{days} days, {hours}h, {minutes}m"
+                            time_str = f"{days}d {hours}h {minutes}m"
+                            widget.time_label.config(text=time_str, font=("Arial", 10, "normal"))
                         else:
                             time_str = "RESET PENDING!"
-                        widget.time_label.config(text=f"Time until reset: {time_str}")
-
-            # Global next reset - only count unmuted vendors that are ready to reset
-            unmuted_vendors = [v for v in self.vendors if not v.muted]
-            ready_vendors = [v for v in unmuted_vendors if v.is_ready_to_reset]
-            
-            if ready_vendors:
-                self.next_reset_label.config(text=f"Ready to reset: {len(ready_vendors)} vendor(s)")
-            elif unmuted_vendors:
-                next_reset = min(v.next_reset for v in unmuted_vendors)
-                td = next_reset - datetime.now()
-                if td.total_seconds() > 0:
-                    days = td.days
-                    hours = td.seconds // 3600
-                    minutes = (td.seconds % 3600) // 60
-                    reset_str = f"{days} days, {hours}h, {minutes}m"
-                else:
-                    reset_str = "RESET PENDING!"
-                self.next_reset_label.config(text=f"Time until next reset: {reset_str}")
-            else:
-                self.next_reset_label.config(text="Time until next reset: --")
-                
+                            font_style = "bold" if self.flash_phase else "normal"
+                            widget.time_label.config(text=time_str, font=("Arial", 10, font_style))
+            self.flash_phase = not self.flash_phase
         except Exception as e:
             print(f"Error updating timers: {e}")
         
-        # Schedule next update
         self.after(1000, self.update_timers)
-
-    def _group_vendors_by_reset_time(self, vendors):
-        if not vendors:
-            return []
-        clusters = []
-        current = [vendors[0]]
-        THRESH = timedelta(hours=1)
-        for i in range(1, len(vendors)):
-            td = vendors[i].next_reset - vendors[i-1].next_reset
-            if td > THRESH:
-                clusters.append(current)
-                current = [vendors[i]]
-            else:
-                current.append(vendors[i])
-        if current:
-            clusters.append(current)
-        return clusters
 
     def update_vendor_list(self):
         try:
-            # Clear existing widgets and pulse list
-            for w in self.scrollable_frame.winfo_children():
-                w.destroy()
-            self.pulse_widgets = []
+            for widget in self.scrollable_frame.winfo_children():
+                widget.destroy()
+            self.pulse_widgets.clear()
 
-            query = self.filter_var.get().lower().strip()
+            filter_text = self.filter_var.get().lower()
             show_muted = self.show_muted_var.get()
-            
-            filtered = []
-            for v in self.vendors:
-                # Filter by muted status
-                if v.muted and not show_muted:
+
+            displayed_vendors = []
+            for vendor in self.vendors:
+                if not show_muted and vendor.muted:
                     continue
-                    
-                # Filter by search query
-                blob = f"{v.name} {v.zone} {' '.join(v.categories)}".lower()
-                if query in blob:
-                    filtered.append(v)
+                if filter_text and not (filter_text in vendor.name.lower() or filter_text in vendor.zone.lower() or any(filter_text in c.lower() for c in vendor.categories)):
+                    continue
+                displayed_vendors.append(vendor)
 
-            sorted_vendors = sorted(filtered, key=lambda x: x.next_reset)
-            clusters = self._group_vendors_by_reset_time(sorted_vendors)
-            total_clusters = len(clusters)
+            # Compute min and max time for not ready vendors
+            not_ready = [v for v in displayed_vendors if not v.is_ready_to_reset]
+            if not_ready:
+                times = [(v.next_reset - datetime.now()).total_seconds() for v in not_ready]
+                max_time = max(times)
+                min_time = min(times)
+            else:
+                max_time = min_time = 0
 
-            for i, cluster in enumerate(clusters):
-                border_color = None
-                if total_clusters >= 3:
-                    if i == 0:
-                        border_color = "#32CD32"
-                    elif i == total_clusters - 1:
-                        border_color = "#8B0000"
+            # Sort displayed_vendors by next_reset ascending (soonest first)
+            displayed_vendors.sort(key=lambda v: v.next_reset)
 
-                for vendor in cluster:
-                    # Determine background color and pulsing
-                    should_pulse = vendor.is_empty and vendor.is_ready_to_reset
-                    
-                    if should_pulse:
-                        bg = "#FFFF00"  # Start with bright yellow for pulsing - this will be overridden by animation
-                    elif vendor.is_empty:
-                        bg = "#D3D3D3"  # Gray for empty
-                    elif vendor.is_ready_to_reset:
-                        bg = "#90EE90"  # Green for ready to reset
+            for vendor in displayed_vendors:
+                time_diff = vendor.next_reset - datetime.now()
+                should_pulse = vendor.is_empty and vendor.is_ready_to_reset and not vendor.muted
+
+                # Determine border color
+                if vendor.is_ready_to_reset:
+                    border_color = "green"
+                else:
+                    t = time_diff.total_seconds()
+                    if max_time > min_time:
+                        ratio = (t - min_time) / (max_time - min_time)
                     else:
-                        bg = "SystemButtonFace"  # Default
+                        ratio = 1.0
+                    r = int(255 * (1 - ratio))  # short: high r, red
+                    g = int(255 * ratio)        # long: high g, green
+                    b = 0
+                    border_color = f"#{r:02x}{g:02x}{b:02x}"
 
-                    parent = tk.Frame(self.scrollable_frame, bg=border_color or "", bd=5 if border_color else 0)
-                    parent.pack(fill=tk.X, pady=5)
-                    parent.vendor_name = vendor.name
+                # Determine background color
+                if vendor.is_empty and not vendor.is_ready_to_reset:
+                    bg_color = "lightgrey"
+                else:
+                    bg_color = "white"
 
-                    vf = tk.Frame(parent, bd=2, relief="groove", padx=5, pady=5, bg=bg)
-                    vf.pack(fill=tk.X, expand=True)
+                # Outer frame for border
+                outer = tk.Frame(self.scrollable_frame)
+                outer.pack(fill=tk.X, padx=4, pady=4)
+                outer.config(bg=border_color)
+                outer.vendor_name = vendor.name
 
-                    info = tk.Frame(vf, bg=bg)
-                    info.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                # Inner frame
+                vf = tk.Frame(outer, bg=bg_color)
+                vf.pack(padx=2, pady=2, fill=tk.X)
 
-                    # Vendor name with muted indicator
-                    name_text = f"{vendor.name} ({vendor.zone})"
-                    if vendor.muted:
-                        name_text += " [MUTED]"
-                    name_label = Label(info, text=name_text, font=("Helvetica", 12, "bold"), bg=bg)
-                    name_label.pack(anchor="w")
+                # Info
+                info = tk.Frame(vf, bg=bg_color)
+                info.pack(fill=tk.X, padx=4, pady=2)
 
-                    council_label = Label(info, text=f"Council left: {format_number(vendor.council_left)}", bg=bg)
-                    council_label.pack(anchor="w")
-                        
-                    if vendor.reset_maximum > 0:
-                        max_label = Label(info, text=f"Reset maximum: {format_number(vendor.reset_maximum)}", bg=bg)
-                        max_label.pack(anchor="w")
-                            
-                    if vendor.categories:
-                        cat_label = Label(info, text="Categories: " + ", ".join(vendor.categories), bg=bg)
-                        cat_label.pack(anchor="w")
+                # Left info
+                left_info = tk.Frame(info, bg=bg_color)
+                left_info.pack(side=tk.LEFT, anchor="w")
 
-                    time_label = Label(info, text="", fg="red", bg=bg)
-                    time_label.pack(anchor="w")
+                name_label = Label(left_info, text=f"{vendor.name} ({vendor.zone})", bg=bg_color, font=("Arial", 10, "bold"))
+                name_label.pack(anchor="w")
 
-                    # Attach time_label to parent so update_timers can find it
-                    parent.time_label = time_label
+                council_str = f"Council: {format_number(vendor.council_left)}"
+                if vendor.reset_maximum > 0:
+                    council_str += f" / Max: {format_number(vendor.reset_maximum)}"
+                council_label = Label(left_info, text=council_str, bg=bg_color)
+                council_label.pack(anchor="w")
 
-                    btns = tk.Frame(vf, bg=bg)
-                    btns.pack(side=tk.RIGHT)
-                        
-                    Button(btns, text="Update", command=lambda v=vendor: self.open_update_vendor_window(v)).pack(padx=5, pady=2)
-                    Button(btns, text="Delete", command=lambda v=vendor: self.delete_vendor(v)).pack(padx=5, pady=2)
-                    
-                    # Mute/Unmute button
-                    mute_text = "Unmute" if vendor.muted else "Mute"
-                    Button(btns, text=mute_text, command=lambda v=vendor: self.toggle_mute_vendor(v)).pack(padx=5, pady=2)
+                # Time label on right
+                time_diff = vendor.next_reset - datetime.now()
+                if time_diff.total_seconds() > 0:
+                    days = time_diff.days
+                    hours = time_diff.seconds // 3600
+                    minutes = (time_diff.seconds % 3600) // 60
+                    time_str = f"{days}d {hours}h {minutes}m"
+                else:
+                    time_str = "RESET PENDING!"
+                time_label = Label(info, text=time_str, bg=bg_color)
+                time_label.pack(side=tk.RIGHT, anchor="e")
+                outer.time_label = time_label
 
-                    # Add to pulse list if needed - AFTER all widgets are created
-                    if should_pulse:
-                        # Store widget references with metadata for better management
-                        pulse_widgets = [vf, info, name_label, council_label, time_label, btns]
-                        if vendor.reset_maximum > 0:
-                            pulse_widgets.append(max_label)
-                        if vendor.categories:
-                            pulse_widgets.append(cat_label)
-                        
-                        # Add each widget to pulse list with proper error handling
-                        for widget in pulse_widgets:
-                            self.pulse_widgets.append({
-                                'widget': widget,
-                                'vendor_name': vendor.name
-                            })
+                # Buttons
+                btns = tk.Frame(vf, bg=bg_color)
+                btns.pack(fill=tk.X, padx=4, pady=2)
+                Button(btns, text="Update", command=lambda v=vendor: self.open_update_vendor_window(v)).pack(side=tk.LEFT, padx=5, pady=2)
+                Button(btns, text="Delete", command=lambda v=vendor: self.delete_vendor(v), fg="red").pack(side=tk.LEFT, padx=5, pady=2)
+                mute_text = "Mute" if not vendor.muted else "Unmute"
+                Button(btns, text=mute_text, command=lambda v=vendor: self.toggle_mute_vendor(v)).pack(side=tk.LEFT, padx=5, pady=2)
 
-            # Update scroll region after adding all widgets
+                # Add to pulse list if needed
+                if should_pulse:
+                    pulse_widgets = [vf, info, left_info, name_label, council_label, time_label, btns]
+                    for widget in pulse_widgets:
+                        self.pulse_widgets.append({
+                            'widget': widget,
+                            'vendor_name': vendor.name
+                        })
+
+            # Update scroll region
             self.canvas.update_idletasks()
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
                         
@@ -613,13 +617,11 @@ class VendorApp(tk.Tk):
             messagebox.showerror("Error", f"Could not update vendor list: {e}")
 
     def toggle_mute_vendor(self, vendor):
-        """Toggle mute status of a vendor"""
         try:
             vendor.muted = not vendor.muted
             save_vendors(self.vendors, self.current_character)
             self.update_vendor_list()
             self.update_total_values()
-            
             status = "muted" if vendor.muted else "unmuted"
             messagebox.showinfo("Success", f"{vendor.name} has been {status}.", parent=self)
         except Exception as e:
@@ -638,9 +640,6 @@ class VendorApp(tk.Tk):
             print(f"Error deleting vendor: {e}")
             messagebox.showerror("Error", f"Could not delete vendor: {e}")
 
-    # ---------------------
-    # Add Vendor Window
-    # ---------------------
     def open_add_vendor_window(self):
         add_window = Toplevel(self)
         add_window.title("Add New Vendor")
@@ -658,25 +657,25 @@ class VendorApp(tk.Tk):
         council_entry = Entry(add_window)
         council_entry.pack(padx=10, fill=tk.X)
 
-        # Time inputs
         time_frame = tk.Frame(add_window)
         time_frame.pack(padx=10, pady=8, anchor="w", fill=tk.X)
         Label(time_frame, text="Time until reset:").pack(side=tk.LEFT)
         Label(time_frame, text="Days:").pack(side=tk.LEFT, padx=(8,0))
         days_entry = Entry(time_frame, width=5)
+        days_entry.insert(0, '6')
         days_entry.pack(side=tk.LEFT, padx=2)
         Label(time_frame, text="Hours:").pack(side=tk.LEFT, padx=(8,0))
         hours_entry = Entry(time_frame, width=5)
+        hours_entry.insert(0, '23')
         hours_entry.pack(side=tk.LEFT, padx=2)
         Label(time_frame, text="Minutes:").pack(side=tk.LEFT, padx=(8,0))
         minutes_entry = Entry(time_frame, width=5)
+        minutes_entry.insert(0, '59')
         minutes_entry.pack(side=tk.LEFT, padx=2)
 
-        # Categories & override row
         cat_override_row = tk.Frame(add_window)
         cat_override_row.pack(padx=10, pady=6, anchor="w", fill=tk.X)
 
-        # Override and muted on the left
         left_options = tk.Frame(cat_override_row)
         left_options.pack(side=tk.LEFT, padx=(0,12), anchor="n")
         
@@ -686,7 +685,6 @@ class VendorApp(tk.Tk):
         muted_var = BooleanVar(value=False)
         Checkbutton(left_options, text="Start Muted", variable=muted_var).pack(anchor="w")
 
-        # Categories area
         cat_area_frame = tk.Frame(cat_override_row)
         cat_area_frame.pack(side=tk.LEFT, anchor="n")
         Label(cat_area_frame, text="Categories:").pack(anchor="w")
@@ -700,7 +698,6 @@ class VendorApp(tk.Tk):
             cb = Checkbutton(cat_frame, text=c, variable=cat_vars[c])
             cb.grid(row=r, column=col, sticky="w", padx=8, pady=4)
 
-        # Custom slot in row=1, col=2
         custom_wrap = tk.Frame(cat_frame)
         custom_wrap.grid(row=1, column=2, sticky="w", padx=8, pady=4)
         custom_var = BooleanVar(value=False)
@@ -709,7 +706,6 @@ class VendorApp(tk.Tk):
         custom_entry = Entry(custom_wrap, width=18)
         custom_entry.pack(side=tk.LEFT, padx=4)
 
-        # Buttons
         button_line = tk.Frame(add_window)
         button_line.pack(padx=10, pady=10, fill=tk.X)
 
@@ -727,7 +723,6 @@ class VendorApp(tk.Tk):
                     messagebox.showerror("Error", "Council must be numeric (K).", parent=add_window)
                     return
 
-                # Raw time values
                 try:
                     d_raw = int(days_entry.get() or 0)
                     h_raw = int(hours_entry.get() or 0)
@@ -753,7 +748,6 @@ class VendorApp(tk.Tk):
                     if cv:
                         selected_cats.append(cv)
 
-                # Dedupe preserve order
                 seen = set()
                 final_cats = []
                 for c in selected_cats:
@@ -777,9 +771,6 @@ class VendorApp(tk.Tk):
         cancel_button = Button(button_line, text="Cancel", command=add_window.destroy)
         cancel_button.pack(side=tk.RIGHT)
 
-    # ---------------------
-    # Update Vendor Window
-    # ---------------------
     def open_update_vendor_window(self, vendor):
         update_window = Toplevel(self)
         update_window.title(f"Update {vendor.name}")
@@ -792,7 +783,6 @@ class VendorApp(tk.Tk):
         council_entry.insert(0, str(vendor.council_left // 1000))
         council_entry.pack(padx=10, fill=tk.X)
 
-        # Prefill time until next reset
         try:
             time_diff = vendor.next_reset - datetime.now()
             init_days = max(0, time_diff.days)
@@ -818,11 +808,9 @@ class VendorApp(tk.Tk):
         minutes_entry.insert(0, str(init_minutes))
         minutes_entry.pack(side=tk.LEFT, padx=2)
 
-        # Categories & override row (same layout as add)
         cat_override_row = tk.Frame(update_window)
         cat_override_row.pack(padx=10, pady=6, anchor="w", fill=tk.X)
 
-        # Override and muted options
         left_options = tk.Frame(cat_override_row)
         left_options.pack(side=tk.LEFT, padx=(0,12), anchor="n")
         
@@ -853,13 +841,11 @@ class VendorApp(tk.Tk):
         custom_entry = Entry(custom_wrap, width=18)
         custom_entry.pack(side=tk.LEFT, padx=4)
 
-        # If vendor has custom categories not in fixed list, prefill custom
         custom_items = [c for c in vendor.categories if c not in categories]
         if custom_items:
             custom_var.set(True)
             custom_entry.insert(0, ", ".join(custom_items))
 
-        # Buttons
         button_line = tk.Frame(update_window)
         button_line.pack(padx=10, pady=10, fill=tk.X)
 
@@ -873,7 +859,6 @@ class VendorApp(tk.Tk):
                     self.update_vendor_list()
                     self.update_total_values()
                     messagebox.showinfo("Success", f"Vendor '{vendor.name}' has been reset.", parent=update_window)
-                    # Don't close the window - just update the time fields
                     time_diff = vendor.next_reset - datetime.now()
                     new_days = max(0, time_diff.days)
                     new_hours = max(0, time_diff.seconds // 3600)
@@ -886,10 +871,8 @@ class VendorApp(tk.Tk):
                     minutes_entry.delete(0, tk.END)
                     minutes_entry.insert(0, str(new_minutes))
                     
-                    # Update council display
                     council_entry.delete(0, tk.END)
                     council_entry.insert(0, str(vendor.council_left // 1000))
-                    
             except Exception as e:
                 print(f"Error resetting vendor: {e}")
                 messagebox.showerror("Error", f"Could not reset vendor: {e}", parent=update_window)
@@ -903,7 +886,6 @@ class VendorApp(tk.Tk):
                     messagebox.showerror("Error", "Council must be numeric (K).", parent=update_window)
                     return
 
-                # Raw time inputs
                 try:
                     d_raw = int(days_entry.get() or 0)
                     h_raw = int(hours_entry.get() or 0)
@@ -932,7 +914,6 @@ class VendorApp(tk.Tk):
                         extras = [x.strip() for x in cv.split(",") if x.strip()]
                         selected_cats.extend(extras)
 
-                # Dedupe preserve order
                 seen = set()
                 final_cats = []
                 for c in selected_cats:
@@ -958,7 +939,6 @@ class VendorApp(tk.Tk):
         close_button.pack(side=tk.RIGHT)
 
     def on_closing(self):
-        """Handle application closing."""
         try:
             self.timer_running = False
             save_vendors(self.vendors, self.current_character)
@@ -973,7 +953,6 @@ class VendorApp(tk.Tk):
 if __name__ == "__main__":
     try:
         app = VendorApp()
-        # Ensure saving on close
         app.protocol("WM_DELETE_WINDOW", app.on_closing)
         app.mainloop()
     except Exception as e:
