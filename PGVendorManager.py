@@ -396,25 +396,37 @@ class VendorApp(tk.Tk):
             return
             
         try:
-            self.pulse_frame = (self.pulse_frame + 1) % 60  # 60 frames = ~6 seconds cycle
+            self.pulse_frame = (self.pulse_frame + 1) % 120  # 120 frames = ~12 seconds cycle for slower pulse
             
-            # Calculate pulse color between yellow and green
-            pulse_ratio = (1 + __import__('math').sin(self.pulse_frame * 0.2)) / 2  # 0 to 1
+            # Calculate pulse color between yellow and green using a smoother sine wave
+            import math
+            pulse_ratio = (1 + math.sin(self.pulse_frame * math.pi / 30)) / 2  # 0 to 1, slower cycle
             
-            # Interpolate between yellow (255,255,0) and green (144,238,144)
-            r = int(255 - (255 - 144) * pulse_ratio)
-            g = int(255 - (255 - 238) * pulse_ratio)
-            b = int(0 + 144 * pulse_ratio)
+            # Interpolate between bright yellow (255,255,0) and bright green (50,205,50)
+            r = int(255 - (255 - 50) * pulse_ratio)
+            g = int(255 - (255 - 205) * pulse_ratio)  
+            b = int(0 + 50 * pulse_ratio)
             
             pulse_color = f"#{r:02x}{g:02x}{b:02x}"
             
             # Update all pulsing widgets
-            for widget in self.pulse_widgets:
-                if widget.winfo_exists():
-                    try:
+            widgets_to_remove = []
+            for widget_info in self.pulse_widgets:
+                widget = widget_info['widget']
+                try:
+                    if widget.winfo_exists():
                         widget.config(bg=pulse_color)
-                    except:
-                        pass  # Widget might not support bg config
+                    else:
+                        widgets_to_remove.append(widget_info)
+                except tk.TclError:
+                    widgets_to_remove.append(widget_info)
+                except Exception as e:
+                    print(f"Error updating widget color: {e}")
+                    widgets_to_remove.append(widget_info)
+            
+            # Clean up destroyed widgets
+            for widget_info in widgets_to_remove:
+                self.pulse_widgets.remove(widget_info)
                         
         except Exception as e:
             print(f"Error updating pulse animation: {e}")
@@ -520,17 +532,17 @@ class VendorApp(tk.Tk):
                         border_color = "#8B0000"
 
                 for vendor in cluster:
-                    bg = "SystemButtonFace"
-                    should_pulse = False
-                    
                     # Determine background color and pulsing
-                    if vendor.is_empty and vendor.is_ready_to_reset:
-                        should_pulse = True
-                        bg = "#FFFF00"  # Start with yellow for pulsing
+                    should_pulse = vendor.is_empty and vendor.is_ready_to_reset
+                    
+                    if should_pulse:
+                        bg = "#FFFF00"  # Start with bright yellow for pulsing - this will be overridden by animation
                     elif vendor.is_empty:
                         bg = "#D3D3D3"  # Gray for empty
                     elif vendor.is_ready_to_reset:
                         bg = "#90EE90"  # Green for ready to reset
+                    else:
+                        bg = "SystemButtonFace"  # Default
 
                     parent = tk.Frame(self.scrollable_frame, bg=border_color or "", bd=5 if border_color else 0)
                     parent.pack(fill=tk.X, pady=5)
@@ -539,14 +551,8 @@ class VendorApp(tk.Tk):
                     vf = tk.Frame(parent, bd=2, relief="groove", padx=5, pady=5, bg=bg)
                     vf.pack(fill=tk.X, expand=True)
 
-                    # Add to pulse list if needed
-                    if should_pulse:
-                        self.pulse_widgets.append(vf)
-
                     info = tk.Frame(vf, bg=bg)
                     info.pack(side=tk.LEFT, fill=tk.X, expand=True)
-                    if should_pulse:
-                        self.pulse_widgets.append(info)
 
                     # Vendor name with muted indicator
                     name_text = f"{vendor.name} ({vendor.zone})"
@@ -554,38 +560,26 @@ class VendorApp(tk.Tk):
                         name_text += " [MUTED]"
                     name_label = Label(info, text=name_text, font=("Helvetica", 12, "bold"), bg=bg)
                     name_label.pack(anchor="w")
-                    if should_pulse:
-                        self.pulse_widgets.append(name_label)
 
                     council_label = Label(info, text=f"Council left: {format_number(vendor.council_left)}", bg=bg)
                     council_label.pack(anchor="w")
-                    if should_pulse:
-                        self.pulse_widgets.append(council_label)
                         
                     if vendor.reset_maximum > 0:
                         max_label = Label(info, text=f"Reset maximum: {format_number(vendor.reset_maximum)}", bg=bg)
                         max_label.pack(anchor="w")
-                        if should_pulse:
-                            self.pulse_widgets.append(max_label)
                             
                     if vendor.categories:
                         cat_label = Label(info, text="Categories: " + ", ".join(vendor.categories), bg=bg)
                         cat_label.pack(anchor="w")
-                        if should_pulse:
-                            self.pulse_widgets.append(cat_label)
 
                     time_label = Label(info, text="", fg="red", bg=bg)
                     time_label.pack(anchor="w")
-                    if should_pulse:
-                        self.pulse_widgets.append(time_label)
 
                     # Attach time_label to parent so update_timers can find it
                     parent.time_label = time_label
 
                     btns = tk.Frame(vf, bg=bg)
                     btns.pack(side=tk.RIGHT)
-                    if should_pulse:
-                        self.pulse_widgets.append(btns)
                         
                     Button(btns, text="Update", command=lambda v=vendor: self.open_update_vendor_window(v)).pack(padx=5, pady=2)
                     Button(btns, text="Delete", command=lambda v=vendor: self.delete_vendor(v)).pack(padx=5, pady=2)
@@ -593,6 +587,22 @@ class VendorApp(tk.Tk):
                     # Mute/Unmute button
                     mute_text = "Unmute" if vendor.muted else "Mute"
                     Button(btns, text=mute_text, command=lambda v=vendor: self.toggle_mute_vendor(v)).pack(padx=5, pady=2)
+
+                    # Add to pulse list if needed - AFTER all widgets are created
+                    if should_pulse:
+                        # Store widget references with metadata for better management
+                        pulse_widgets = [vf, info, name_label, council_label, time_label, btns]
+                        if vendor.reset_maximum > 0:
+                            pulse_widgets.append(max_label)
+                        if vendor.categories:
+                            pulse_widgets.append(cat_label)
+                        
+                        # Add each widget to pulse list with proper error handling
+                        for widget in pulse_widgets:
+                            self.pulse_widgets.append({
+                                'widget': widget,
+                                'vendor_name': vendor.name
+                            })
 
             # Update scroll region after adding all widgets
             self.canvas.update_idletasks()
