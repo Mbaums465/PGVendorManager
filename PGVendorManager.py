@@ -27,7 +27,7 @@ def _ensure_data_dir():
         messagebox.showerror("Error", f"Could not create data directory: {e}")
 
 def init_database():
-    """Initialize SQLite database and create vendors table if it doesn't exist."""
+    """Initialize SQLite database and create vendors and transactions tables if they don't exist."""
     _ensure_data_dir()
     try:
         with sqlite3.connect(DATABASE_PATH) as conn:
@@ -46,10 +46,160 @@ def init_database():
                     UNIQUE(character_name, name)
                 )
             ''')
+            
+            # New transactions table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    character_name TEXT NOT NULL,
+                    vendor_name TEXT NOT NULL,
+                    transaction_type TEXT NOT NULL,
+                    council_before INTEGER NOT NULL,
+                    council_after INTEGER NOT NULL,
+                    council_change INTEGER NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    notes TEXT
+                )
+            ''')
+            
+            # Index for faster queries
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_transactions_lookup 
+                ON transactions(character_name, vendor_name, timestamp)
+            ''')
+            
             conn.commit()
     except sqlite3.Error as e:
         print(f"Error initializing database: {e}")
         messagebox.showerror("Error", f"Could not initialize database: {e}")
+
+def log_transaction(character_name, vendor_name, transaction_type, council_before, council_after, notes=None):
+    """Log a transaction to the database."""
+    try:
+        council_change = council_after - council_before
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO transactions (
+                    character_name, vendor_name, transaction_type,
+                    council_before, council_after, council_change,
+                    timestamp, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                character_name,
+                vendor_name,
+                transaction_type,
+                council_before,
+                council_after,
+                council_change,
+                datetime.now().isoformat(),
+                notes
+            ))
+            conn.commit()
+    except sqlite3.Error as e:
+        print(f"Error logging transaction: {e}")
+
+def get_council_earned(character_name, vendor_name=None, days=7):
+    """Get total council earned (spent) in the last N days for a character or specific vendor.
+    Earned = how much was spent from vendors (reset_maximum - current_council)."""
+    try:
+        cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            if vendor_name:
+                # For a specific vendor, sum all negative changes (purchases) and positive resets
+                cursor.execute('''
+                    SELECT SUM(ABS(council_change)) FROM transactions
+                    WHERE character_name = ? AND vendor_name = ?
+                    AND timestamp >= ? AND transaction_type IN ('purchase', 'adjustment')
+                    AND council_change < 0
+                ''', (character_name, vendor_name, cutoff_date))
+                result = cursor.fetchone()
+                spent = result[0] if result[0] is not None else 0
+                
+                # Add the current amount spent (max - current) if no transactions exist
+                cursor.execute('''
+                    SELECT council_left, reset_maximum FROM vendors
+                    WHERE character_name = ? AND name = ?
+                ''', (character_name, vendor_name))
+                vendor_row = cursor.fetchone()
+                if vendor_row:
+                    council_left, reset_maximum = vendor_row
+                    current_spent = reset_maximum - council_left
+                    # Only add current spent if there are no recent transactions
+                    cursor.execute('''
+                        SELECT COUNT(*) FROM transactions
+                        WHERE character_name = ? AND vendor_name = ?
+                        AND timestamp >= ?
+                    ''', (character_name, vendor_name, cutoff_date))
+                    if cursor.fetchone()[0] == 0:
+                        spent += current_spent
+                
+                return spent
+            else:
+                # For all vendors, calculate total spent
+                total_earned = 0
+                cursor.execute('''
+                    SELECT name, council_left, reset_maximum FROM vendors
+                    WHERE character_name = ?
+                ''', (character_name,))
+                vendors = cursor.fetchall()
+                
+                for vendor_name, council_left, reset_maximum in vendors:
+                    # Get transaction-based spending
+                    cursor.execute('''
+                        SELECT SUM(ABS(council_change)) FROM transactions
+                        WHERE character_name = ? AND vendor_name = ?
+                        AND timestamp >= ? AND transaction_type IN ('purchase', 'adjustment')
+                        AND council_change < 0
+                    ''', (character_name, vendor_name, cutoff_date))
+                    result = cursor.fetchone()
+                    spent = result[0] if result[0] is not None else 0
+                    
+                    # Add current spent amount if no recent transactions
+                    current_spent = reset_maximum - council_left
+                    cursor.execute('''
+                        SELECT COUNT(*) FROM transactions
+                        WHERE character_name = ? AND vendor_name = ?
+                        AND timestamp >= ?
+                    ''', (character_name, vendor_name, cutoff_date))
+                    if cursor.fetchone()[0] == 0:
+                        spent += current_spent
+                    
+                    total_earned += spent
+                
+                return total_earned
+    except sqlite3.Error as e:
+        print(f"Error getting council earned: {e}")
+        return 0
+
+def get_transactions(character_name, vendor_name=None, start_date=None, end_date=None):
+    """Query transactions within a specific timeframe."""
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            query = 'SELECT * FROM transactions WHERE character_name = ?'
+            params = [character_name]
+            
+            if vendor_name:
+                query += ' AND vendor_name = ?'
+                params.append(vendor_name)
+            
+            if start_date:
+                query += ' AND timestamp >= ?'
+                params.append(start_date.isoformat() if isinstance(start_date, datetime) else start_date)
+            
+            if end_date:
+                query += ' AND timestamp <= ?'
+                params.append(end_date.isoformat() if isinstance(end_date, datetime) else end_date)
+            
+            query += ' ORDER BY timestamp DESC'
+            
+            cursor.execute(query, params)
+            return cursor.fetchall()
+    except sqlite3.Error as e:
+        print(f"Error querying transactions: {e}")
+        return []
 
 def migrate_json_to_sqlite():
     """Migrate existing JSON files to SQLite database."""
@@ -82,16 +232,13 @@ def migrate_json_to_sqlite():
                                     bool(vendor_data.get("muted", False))
                                 ))
                     conn.commit()
-                    # Rename with timestamp to avoid conflicts
                     backup_path = file_path + f'.backup_{int(time.time())}'
                     os.rename(file_path, backup_path)
                     print(f"Migrated {json_file} to SQLite and renamed to {os.path.basename(backup_path)}")
                 except (json.JSONDecodeError, IOError, sqlite3.Error) as e:
                     print(f"Error migrating {json_file}: {e}")
-                    # No messagebox to avoid pop-ups
                 except OSError as e:
                     print(f"Error renaming {json_file}: {e}")
-                    # No messagebox
     except OSError as e:
         print(f"Error accessing data directory: {e}")
 
@@ -285,24 +432,19 @@ class VendorApp(tk.Tk):
         self.title("Vendor Reset Manager")
         self.geometry("900x600")
 
-        # Initialize database
         init_database()
         migrate_json_to_sqlite()
 
-        # Initialize vendors list
         self.vendors = []
         
-        # Load characters
         self.characters = get_all_characters()
         self.current_character = self.characters[0] if self.characters else DEFAULT_CHARACTER
 
         self.vendors = load_vendors(self.current_character)
 
-        # Pulsing animation state
         self.pulse_frame = 0
         self.pulse_widgets = []
 
-        # Flashing state for "RESET PENDING!"
         self.flash_phase = False
 
         self.create_widgets()
@@ -324,6 +466,7 @@ class VendorApp(tk.Tk):
         self.char_menu.pack(side=tk.LEFT, padx=6)
 
         Button(top, text="Add New Character", command=self.add_new_character).pack(side=tk.LEFT, padx=6)
+        Button(top, text="View Transactions", command=self.open_transactions_window).pack(side=tk.LEFT, padx=6)
 
         Label(top, text="Filter:").pack(side=tk.LEFT, padx=(12,4))
         self.filter_var = StringVar()
@@ -340,8 +483,8 @@ class VendorApp(tk.Tk):
         self.total_council_label.pack(side=tk.LEFT, padx=8, pady=6)
         self.total_max_label = Label(info, text="Total Vendor Cash: 0K", bg="lightgrey")
         self.total_max_label.pack(side=tk.LEFT, padx=8, pady=6)
-        self.next_reset_label = Label(info, text="Time until next reset: --", bg="lightgrey")
-        self.next_reset_label.pack(side=tk.LEFT, padx=8, pady=6)
+        self.earned_7d_label = Label(info, text="Council earned (7d): 0K", bg="lightgrey")
+        self.earned_7d_label.pack(side=tk.LEFT, padx=8, pady=6)
 
         btns = tk.Frame(self)
         btns.pack(fill=tk.X, padx=8, pady=4)
@@ -379,6 +522,70 @@ class VendorApp(tk.Tk):
         self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
         self.canvas.bind_all("<Button-4>", _on_mousewheel)
         self.canvas.bind_all("<Button-5>", _on_mousewheel)
+
+    def open_transactions_window(self):
+        """Open window to view and query transactions."""
+        trans_window = Toplevel(self)
+        trans_window.title("Transaction History")
+        trans_window.geometry("800x600")
+
+        controls = tk.Frame(trans_window)
+        controls.pack(fill=tk.X, padx=10, pady=10)
+
+        Label(controls, text="Days to show:").pack(side=tk.LEFT, padx=5)
+        days_var = StringVar(value="7")
+        days_entry = Entry(controls, textvariable=days_var, width=5)
+        days_entry.pack(side=tk.LEFT, padx=5)
+
+        def refresh_transactions():
+            try:
+                days = int(days_var.get())
+                start_date = datetime.now() - timedelta(days=days)
+                transactions = get_transactions(self.current_character, start_date=start_date)
+                
+                for widget in text_frame.winfo_children():
+                    widget.destroy()
+                
+                total_earned = 0
+                for trans in transactions:
+                    trans_id, char, vendor, trans_type, before, after, change, timestamp, notes = trans
+                    if change > 0:
+                        total_earned += change
+                    
+                    color = "green" if change > 0 else "red" if change < 0 else "black"
+                    dt = datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M")
+                    
+                    trans_text = f"{dt} | {vendor} | {trans_type.upper()} | {format_number(change)} council"
+                    if notes:
+                        trans_text += f" | {notes}"
+                    
+                    label = Label(text_frame, text=trans_text, fg=color, anchor="w")
+                    label.pack(fill=tk.X, padx=5, pady=2)
+                
+                summary = Label(text_frame, text=f"\nTotal Council Earned: {format_number(total_earned)}", 
+                               font=("Arial", 10, "bold"))
+                summary.pack(fill=tk.X, padx=5, pady=10)
+                
+            except ValueError:
+                messagebox.showerror("Error", "Days must be a number", parent=trans_window)
+
+        Button(controls, text="Refresh", command=refresh_transactions).pack(side=tk.LEFT, padx=5)
+
+        text_frame_container = tk.Frame(trans_window)
+        text_frame_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        canvas = Canvas(text_frame_container)
+        scrollbar = Scrollbar(text_frame_container, orient="vertical", command=canvas.yview)
+        text_frame = tk.Frame(canvas)
+
+        text_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=text_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        refresh_transactions()
 
     def on_char_change(self, *args):
         try:
@@ -430,8 +637,11 @@ class VendorApp(tk.Tk):
             unmuted_vendors = [v for v in self.vendors if not v.muted]
             total_council = sum(v.council_left for v in unmuted_vendors)
             total_maximum = sum(v.reset_maximum for v in unmuted_vendors)
+            total_earned_7d = get_council_earned(self.current_character, days=7)
+            
             self.total_council_label.config(text=f"Current Vendor Council Pool: {format_number(total_council)}")
             self.total_max_label.config(text=f"Total Vendor Cash: {format_number(total_maximum)}")
+            self.earned_7d_label.config(text=f"Council earned (7d): {format_number(total_earned_7d)}")
         except Exception as e:
             print(f"Error updating total values: {e}")
 
@@ -515,7 +725,6 @@ class VendorApp(tk.Tk):
                     continue
                 displayed_vendors.append(vendor)
 
-            # Compute min and max time for not ready vendors
             not_ready = [v for v in displayed_vendors if not v.is_ready_to_reset]
             if not_ready:
                 times = [(v.next_reset - datetime.now()).total_seconds() for v in not_ready]
@@ -524,14 +733,12 @@ class VendorApp(tk.Tk):
             else:
                 max_time = min_time = 0
 
-            # Sort displayed_vendors by next_reset ascending (soonest first)
             displayed_vendors.sort(key=lambda v: v.next_reset)
 
             for vendor in displayed_vendors:
                 time_diff = vendor.next_reset - datetime.now()
                 should_pulse = vendor.is_empty and vendor.is_ready_to_reset and not vendor.muted
 
-                # Determine border color
                 if vendor.is_ready_to_reset:
                     border_color = "green"
                 else:
@@ -540,32 +747,27 @@ class VendorApp(tk.Tk):
                         ratio = (t - min_time) / (max_time - min_time)
                     else:
                         ratio = 1.0
-                    r = int(255 * (1 - ratio))  # short: high r, red
-                    g = int(255 * ratio)        # long: high g, green
+                    r = int(255 * (1 - ratio))
+                    g = int(255 * ratio)
                     b = 0
                     border_color = f"#{r:02x}{g:02x}{b:02x}"
 
-                # Determine background color
                 if vendor.is_empty and not vendor.is_ready_to_reset:
                     bg_color = "lightgrey"
                 else:
                     bg_color = "white"
 
-                # Outer frame for border
                 outer = tk.Frame(self.scrollable_frame)
                 outer.pack(fill=tk.X, padx=4, pady=4)
                 outer.config(bg=border_color)
                 outer.vendor_name = vendor.name
 
-                # Inner frame
                 vf = tk.Frame(outer, bg=bg_color)
                 vf.pack(padx=2, pady=2, fill=tk.X)
 
-                # Info
                 info = tk.Frame(vf, bg=bg_color)
                 info.pack(fill=tk.X, padx=4, pady=2)
 
-                # Left info
                 left_info = tk.Frame(info, bg=bg_color)
                 left_info.pack(side=tk.LEFT, anchor="w")
 
@@ -578,7 +780,7 @@ class VendorApp(tk.Tk):
                 council_label = Label(left_info, text=council_str, bg=bg_color)
                 council_label.pack(anchor="w")
 
-                # Time label on right
+                # Show time until reset (reverting from earned display)
                 time_diff = vendor.next_reset - datetime.now()
                 if time_diff.total_seconds() > 0:
                     days = time_diff.days
@@ -591,7 +793,6 @@ class VendorApp(tk.Tk):
                 time_label.pack(side=tk.RIGHT, anchor="e")
                 outer.time_label = time_label
 
-                # Buttons
                 btns = tk.Frame(vf, bg=bg_color)
                 btns.pack(fill=tk.X, padx=4, pady=2)
                 Button(btns, text="Update", command=lambda v=vendor: self.open_update_vendor_window(v)).pack(side=tk.LEFT, padx=5, pady=2)
@@ -599,16 +800,14 @@ class VendorApp(tk.Tk):
                 mute_text = "Mute" if not vendor.muted else "Unmute"
                 Button(btns, text=mute_text, command=lambda v=vendor: self.toggle_mute_vendor(v)).pack(side=tk.LEFT, padx=5, pady=2)
 
-                # Add to pulse list if needed
                 if should_pulse:
-                    pulse_widgets = [vf, info, left_info, name_label, council_label, time_label, btns]
+                    pulse_widgets = [vf, info, left_info, name_label, council_label, earned_label, btns]
                     for widget in pulse_widgets:
                         self.pulse_widgets.append({
                             'widget': widget,
                             'vendor_name': vendor.name
                         })
 
-            # Update scroll region
             self.canvas.update_idletasks()
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
                         
@@ -631,6 +830,15 @@ class VendorApp(tk.Tk):
     def delete_vendor(self, vendor_to_delete):
         try:
             if messagebox.askyesno("Delete Vendor", f"Are you sure you want to delete {vendor_to_delete.name}?", parent=self):
+                log_transaction(
+                    self.current_character,
+                    vendor_to_delete.name,
+                    'deletion',
+                    vendor_to_delete.council_left,
+                    0,
+                    f"Vendor deleted with {vendor_to_delete.council_left} council remaining"
+                )
+                
                 self.vendors = [v for v in self.vendors if v.name != vendor_to_delete.name]
                 save_vendors(self.vendors, self.current_character)
                 self.update_vendor_list()
@@ -756,6 +964,16 @@ class VendorApp(tk.Tk):
                         final_cats.append(c)
 
                 new_vendor = Vendor(name, zone, council, last_reset, reset_maximum, final_cats, is_muted)
+                
+                log_transaction(
+                    self.current_character,
+                    name,
+                    'creation',
+                    0,
+                    council,
+                    f"Vendor created with initial council: {format_number(council)}"
+                )
+                
                 self.vendors.append(new_vendor)
                 save_vendors(self.vendors, self.current_character)
                 self.update_vendor_list()
@@ -852,9 +1070,20 @@ class VendorApp(tk.Tk):
         def reset_now():
             try:
                 if messagebox.askyesno("Confirm Reset", f"Are you sure you want to reset {vendor.name}?", parent=update_window):
+                    old_council = vendor.council_left
                     vendor.last_reset = datetime.now()
                     if vendor.reset_maximum > 0:
                         vendor.council_left = vendor.reset_maximum
+                    
+                    log_transaction(
+                        self.current_character,
+                        vendor.name,
+                        'reset',
+                        old_council,
+                        vendor.council_left,
+                        f"Manual reset from {format_number(old_council)} to {format_number(vendor.council_left)}"
+                    )
+                    
                     save_vendors(self.vendors, self.current_character)
                     self.update_vendor_list()
                     self.update_total_values()
@@ -879,6 +1108,8 @@ class VendorApp(tk.Tk):
 
         def update_vendor_action():
             try:
+                old_council = vendor.council_left
+                
                 try:
                     council_input = float(council_entry.get() or 0)
                     new_council = int(council_input * 1000)
@@ -906,6 +1137,17 @@ class VendorApp(tk.Tk):
                     vendor.reset_maximum = new_council
                 vendor.last_reset = calculate_last_reset(d, h, m, override_flag)
                 vendor.muted = muted_var.get()
+
+                if old_council != new_council:
+                    transaction_type = 'purchase' if new_council < old_council else 'adjustment'
+                    log_transaction(
+                        self.current_character,
+                        vendor.name,
+                        transaction_type,
+                        old_council,
+                        new_council,
+                        f"Manual update: {format_number(old_council)} → {format_number(new_council)}"
+                    )
 
                 selected_cats = [c for c, var in cat_vars.items() if var.get()]
                 if custom_var.get():
