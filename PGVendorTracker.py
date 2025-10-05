@@ -801,7 +801,7 @@ class VendorApp(tk.Tk):
                 Button(btns, text=mute_text, command=lambda v=vendor: self.toggle_mute_vendor(v)).pack(side=tk.LEFT, padx=5, pady=2)
 
                 if should_pulse:
-                    pulse_widgets = [vf, info, left_info, name_label, council_label, earned_label, btns]
+                    pulse_widgets = [vf, info, left_info, name_label, council_label, time_label, btns]
                     for widget in pulse_widgets:
                         self.pulse_widgets.append({
                             'widget': widget,
