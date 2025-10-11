@@ -1,8 +1,10 @@
 import tkinter as tk
 from tkinter import messagebox, Toplevel, Label, Entry, Button, Scrollbar, Canvas, OptionMenu, StringVar, simpledialog, Checkbutton, BooleanVar
+from tkinter import ttk
 import sqlite3
 import json
 from datetime import datetime, timedelta
+from collections import defaultdict
 import os
 import sys
 import time
@@ -537,13 +539,48 @@ class VendorApp(tk.Tk):
         days_entry = Entry(controls, textvariable=days_var, width=5)
         days_entry.pack(side=tk.LEFT, padx=5)
 
+        # Create notebook for tabs
+        notebook = ttk.Notebook(trans_window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Tab 1: Transaction List
+        trans_tab = tk.Frame(notebook)
+        notebook.add(trans_tab, text="Transaction List")
+
+        trans_canvas = Canvas(trans_tab)
+        trans_scrollbar = Scrollbar(trans_tab, orient="vertical", command=trans_canvas.yview)
+        trans_frame = tk.Frame(trans_canvas)
+
+        trans_frame.bind("<Configure>", lambda e: trans_canvas.configure(scrollregion=trans_canvas.bbox("all")))
+        trans_canvas.create_window((0, 0), window=trans_frame, anchor="nw")
+        trans_canvas.configure(yscrollcommand=trans_scrollbar.set)
+
+        trans_canvas.pack(side="left", fill="both", expand=True)
+        trans_scrollbar.pack(side="right", fill="y")
+
+        # Tab 2: Daily Earnings
+        daily_tab = tk.Frame(notebook)
+        notebook.add(daily_tab, text="Daily Earnings")
+
+        daily_canvas = Canvas(daily_tab)
+        daily_scrollbar = Scrollbar(daily_tab, orient="vertical", command=daily_canvas.yview)
+        daily_frame = tk.Frame(daily_canvas)
+
+        daily_frame.bind("<Configure>", lambda e: daily_canvas.configure(scrollregion=daily_canvas.bbox("all")))
+        daily_canvas.create_window((0, 0), window=daily_frame, anchor="nw")
+        daily_canvas.configure(yscrollcommand=daily_scrollbar.set)
+
+        daily_canvas.pack(side="left", fill="both", expand=True)
+        daily_scrollbar.pack(side="right", fill="y")
+
         def refresh_transactions():
             try:
                 days = int(days_var.get())
                 start_date = datetime.now() - timedelta(days=days)
                 transactions = get_transactions(self.current_character, start_date=start_date)
                 
-                for widget in text_frame.winfo_children():
+                # Clear transaction list tab
+                for widget in trans_frame.winfo_children():
                     widget.destroy()
                 
                 total_earned = 0
@@ -559,31 +596,65 @@ class VendorApp(tk.Tk):
                     if notes:
                         trans_text += f" | {notes}"
                     
-                    label = Label(text_frame, text=trans_text, fg=color, anchor="w")
+                    label = Label(trans_frame, text=trans_text, fg=color, anchor="w")
                     label.pack(fill=tk.X, padx=5, pady=2)
                 
-                summary = Label(text_frame, text=f"\nTotal Council Earned: {format_number(total_earned)}", 
+                summary = Label(trans_frame, text=f"\nTotal Council Earned: {format_number(total_earned)}", 
                                font=("Arial", 10, "bold"))
                 summary.pack(fill=tk.X, padx=5, pady=10)
+                
+                # Clear daily earnings tab
+                for widget in daily_frame.winfo_children():
+                    widget.destroy()
+                
+                # Calculate daily earnings
+                daily_earnings = defaultdict(int)
+                for trans in transactions:
+                    trans_id, char, vendor, trans_type, before, after, change, timestamp, notes = trans
+                    # Only count purchases/spending as "earned"
+                    if change < 0:
+                        dt = datetime.fromisoformat(timestamp)
+                        date_key = dt.date()
+                        daily_earnings[date_key] += abs(change)
+                
+                # Create list of all dates in range (most recent first)
+                all_dates = []
+                for i in range(days):
+                    date = (datetime.now() - timedelta(days=i)).date()
+                    all_dates.append(date)
+                
+                # Display daily earnings
+                Label(daily_frame, text="Daily Council Earned", font=("Arial", 12, "bold")).grid(row=0, column=0, columnspan=2, padx=5, pady=10, sticky="w")
+                
+                # Column headers
+                Label(daily_frame, text="Date", font=("Arial", 10, "bold"), anchor="w", relief="solid", borderwidth=1, padx=5, pady=3).grid(row=1, column=0, sticky="ew")
+                Label(daily_frame, text="Council Earned", font=("Arial", 10, "bold"), anchor="e", relief="solid", borderwidth=1, padx=5, pady=3).grid(row=1, column=1, sticky="ew")
+                
+                total_daily = 0
+                row = 2
+                for date in all_dates:
+                    earned = daily_earnings.get(date, 0)
+                    total_daily += earned
+                    
+                    weekday = date.strftime("%A")
+                    date_str = date.strftime("%Y-%m-%d")
+                    
+                    color = "green" if earned > 0 else "gray"
+                    date_text = f"{weekday}, {date_str}"
+                    council_text = format_number(earned)
+                    
+                    Label(daily_frame, text=date_text, fg=color, anchor="w", font=("Arial", 10), relief="solid", borderwidth=1, padx=5, pady=3).grid(row=row, column=0, sticky="ew")
+                    Label(daily_frame, text=council_text, fg=color, anchor="e", font=("Arial", 10), relief="solid", borderwidth=1, padx=5, pady=3).grid(row=row, column=1, sticky="ew")
+                    row += 1
+                
+                # Total row
+                Label(daily_frame, text="Total:", font=("Arial", 10, "bold"), anchor="w", relief="solid", borderwidth=1, padx=5, pady=3).grid(row=row, column=0, sticky="ew")
+                Label(daily_frame, text=f"{format_number(total_daily)}", font=("Arial", 10, "bold"), anchor="e", relief="solid", borderwidth=1, padx=5, pady=3).grid(row=row, column=1, sticky="ew")
                 
             except ValueError:
                 messagebox.showerror("Error", "Days must be a number", parent=trans_window)
 
         Button(controls, text="Refresh", command=refresh_transactions).pack(side=tk.LEFT, padx=5)
-
-        text_frame_container = tk.Frame(trans_window)
-        text_frame_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        canvas = Canvas(text_frame_container)
-        scrollbar = Scrollbar(text_frame_container, orient="vertical", command=canvas.yview)
-        text_frame = tk.Frame(canvas)
-
-        text_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=text_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
 
         refresh_transactions()
 
