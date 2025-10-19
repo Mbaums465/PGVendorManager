@@ -228,8 +228,8 @@ class VendorDatabase:
             return [DEFAULT_CHARACTER]
     
     def log_transaction(self, character_name: str, vendor_name: str, 
-                       transaction_type: str, council_before: int, 
-                       council_after: int, notes: Optional[str] = None):
+                        transaction_type: str, council_before: int, 
+                        council_after: int, notes: Optional[str] = None):
         """Log a transaction."""
         try:
             council_change = council_after - council_before
@@ -251,8 +251,8 @@ class VendorDatabase:
             print(f"Error logging transaction: {e}")
     
     def get_council_earned(self, character_name: str, 
-                          vendor_name: Optional[str] = None, 
-                          days: int = 7) -> int:
+                           vendor_name: Optional[str] = None, 
+                           days: int = 7) -> int:
         """Get total council earned in the last N days."""
         try:
             cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
@@ -268,7 +268,7 @@ class VendorDatabase:
             return 0
     
     def _get_vendor_earned(self, cursor, character_name: str, 
-                          vendor_name: str, cutoff_date: str) -> int:
+                           vendor_name: str, cutoff_date: str) -> int:
         """Calculate earned for a specific vendor."""
         cursor.execute('''
             SELECT SUM(ABS(council_change)) FROM transactions
@@ -334,9 +334,9 @@ class VendorDatabase:
         return total_earned
     
     def get_transactions(self, character_name: str, 
-                        vendor_name: Optional[str] = None,
-                        start_date: Optional[datetime] = None,
-                        end_date: Optional[datetime] = None) -> List[Tuple]:
+                         vendor_name: Optional[str] = None,
+                         start_date: Optional[datetime] = None,
+                         end_date: Optional[datetime] = None) -> List[Tuple]:
         """Query transactions within a timeframe."""
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -421,15 +421,27 @@ class Vendor:
         """Get time until next reset."""
         return TimeUntilReset.from_timedelta(self.next_reset - datetime.now())
     
+    # --- MODIFIED: Enhanced Multi-Term Search Logic ---
     def matches_filter(self, filter_text: str) -> bool:
-        """Check if vendor matches filter text."""
+        """
+        Check if vendor matches filter text.
+        Supports multi-term searching with AND logic.
+        """
         if not filter_text:
             return True
-        
-        filter_lower = filter_text.lower()
-        return (filter_lower in self.name.lower() or 
-                filter_lower in self.zone.lower() or
-                any(filter_lower in c.lower() for c in self.categories))
+
+        # Split the search query into individual terms
+        search_terms = filter_text.lower().split()
+
+        # Combine all searchable vendor attributes into a single string for easy searching
+        vendor_info = " ".join([
+            self.name.lower(),
+            self.zone.lower(),
+            *map(str.lower, self.categories)
+        ])
+
+        # Check if ALL search terms are present in the combined info string
+        return all(term in vendor_info for term in search_terms)
 
 
 # ---------------------
@@ -483,45 +495,62 @@ def calculate_pulse_color(frame: int) -> str:
 # ---------------------
 # UI Components
 # ---------------------
+# --- MODIFIED: Reliable Scrolling Logic ---
 class ScrollableFrame(tk.Frame):
-    """Reusable scrollable frame component."""
-    
+    """
+    A reusable scrollable frame component that handles mousewheel scrolling reliably
+    by only binding scroll events when the mouse is over the frame.
+    """
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
-        
-        self.canvas = Canvas(self)
-        self.scrollbar = Scrollbar(self, orient="vertical", command=self.canvas.yview)
+
+        self.canvas = tk.Canvas(self)
+        self.scrollbar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.scrollable_frame = tk.Frame(self.canvas)
-        
+
         self.scrollable_frame.bind(
             "<Configure>",
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         )
-        
+
         self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        
+
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
-        
-        self._setup_mousewheel()
-    
-    def _setup_mousewheel(self):
-        """Setup mousewheel scrolling."""
-        def on_mousewheel(event):
-            try:
-                if hasattr(event, 'delta'):
-                    self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-                elif event.num == 4:
-                    self.canvas.yview_scroll(-1, "units")
-                elif event.num == 5:
-                    self.canvas.yview_scroll(1, "units")
-            except Exception as e:
-                print(f"Mouse wheel error: {e}")
-        
-        self.canvas.bind_all("<MouseWheel>", on_mousewheel)
-        self.canvas.bind_all("<Button-4>", on_mousewheel)
-        self.canvas.bind_all("<Button-5>", on_mousewheel)
+
+        # Bind mousewheel events only when the cursor is over this specific frame
+        self.bind('<Enter>', self._bind_mousewheel)
+        self.bind('<Leave>', self._unbind_mousewheel)
+
+    def _on_mousewheel(self, event):
+        """Handle mousewheel scrolling, compatible with Windows, macOS, and Linux."""
+        try:
+            # Windows and macOS use event.delta
+            if hasattr(event, 'delta'):
+                self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            # Linux uses event.num for scrolling up (4) and down (5)
+            elif event.num == 4:
+                self.canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                self.canvas.yview_scroll(1, "units")
+        except tk.TclError:
+            # This exception can occur if the widget is destroyed during a scroll event
+            pass
+
+    def _bind_mousewheel(self, event):
+        """Bind mousewheel events when the mouse enters the frame."""
+        # Using bind_all ensures that scrolling works even if the mouse
+        # is over a child widget (like a button or label) inside the frame.
+        self.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.bind_all("<Button-4>", self._on_mousewheel)
+        self.bind_all("<Button-5>", self._on_mousewheel)
+
+    def _unbind_mousewheel(self, event):
+        """Unbind mousewheel events when the mouse leaves the frame."""
+        self.unbind_all("<MouseWheel>")
+        self.unbind_all("<Button-4>")
+        self.unbind_all("<Button-5>")
 
 
 class VendorForm:
@@ -624,11 +653,11 @@ class VendorForm:
         left_options.pack(side=tk.LEFT, padx=(0,12), anchor="n")
         
         Checkbutton(left_options, text="Max-Time-Override", 
-                   variable=self.max_time_override_var).pack(anchor="w")
+                    variable=self.max_time_override_var).pack(anchor="w")
         
         mute_text = "Muted" if self.is_update else "Start Muted"
         Checkbutton(left_options, text=mute_text, 
-                   variable=self.muted_var).pack(anchor="w")
+                    variable=self.muted_var).pack(anchor="w")
         
         # Categories
         cat_area_frame = tk.Frame(cat_override_row)
@@ -755,8 +784,8 @@ class VendorCard:
         left_info.pack(side=tk.LEFT, anchor="w")
         
         name_label = Label(left_info, 
-                          text=f"{self.vendor.name} ({self.vendor.zone})", 
-                          bg=bg_color, font=("Arial", 10, "bold"))
+                           text=f"{self.vendor.name} ({self.vendor.zone})", 
+                           bg=bg_color, font=("Arial", 10, "bold"))
         name_label.pack(anchor="w")
         
         council_str = f"Council: {format_number(self.vendor.council_left)}"
@@ -879,8 +908,8 @@ class TransactionWindow:
             label.pack(fill=tk.X, padx=5, pady=2)
         
         summary = Label(self.trans_frame, 
-                       text=f"\nTotal Council Earned: {format_number(total_earned)}", 
-                       font=("Arial", 10, "bold"))
+                          text=f"\nTotal Council Earned: {format_number(total_earned)}", 
+                          font=("Arial", 10, "bold"))
         summary.pack(fill=tk.X, padx=5, pady=10)
     
     def _display_daily_earnings(self, transactions: List[Tuple], days: int):
@@ -1244,7 +1273,7 @@ class VendorApp(tk.Tk):
         self.pulse_widgets.clear()
         
         # Filter vendors
-        filter_text = self.filter_var.get().lower()
+        filter_text = self.filter_var.get() # No need for .lower() here, handled in matches_filter
         show_muted = self.show_muted_var.get()
         
         displayed_vendors = [
