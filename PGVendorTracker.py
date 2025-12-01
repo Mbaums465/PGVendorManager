@@ -1,26 +1,31 @@
 import tkinter as tk
-from tkinter import messagebox, Toplevel, Label, Entry, Button, Scrollbar, Canvas, OptionMenu, StringVar, simpledialog, Checkbutton, BooleanVar
+from tkinter import messagebox, Toplevel, Label, Entry, Button, Scrollbar, Canvas, OptionMenu, StringVar, simpledialog, Checkbutton, BooleanVar, filedialog
 from tkinter import ttk
 import sqlite3
 import json
+import re
 from datetime import datetime, timedelta
 from collections import defaultdict
 import os
 import sys
 import time
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Set
 from dataclasses import dataclass
 
 # ---------------------
 # Constants
 # ---------------------
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'character_data')
-DATABASE_PATH = os.path.join(DATA_DIR, 'vendors.db')
+DATABASE_PATH = os.path.join(DATA_DIR, 'vendors_auto.db')
 DEFAULT_CHARACTER = 'Default'
 MAX_DAYS = 6
 MAX_HOURS = 23
 MAX_MINUTES = 59
 MAX_TOTAL_MINUTES = MAX_DAYS * 24 * 60 + MAX_HOURS * 60 + MAX_MINUTES
+
+# Default Player.log path (Windows)
+DEFAULT_LOG_PATH = os.path.expandvars(r'C:\Users\%USERNAME%\AppData\LocalLow\Elder Game\Project Gorgon\Player.log')
+SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
 
 # UI Constants
 VENDOR_CATEGORIES = ["Jewelry", "Armor", "Weapons", "Scrolls", "Misc"]
@@ -28,11 +33,19 @@ PULSE_FRAME_MAX = 120
 PULSE_CYCLE_DIVISOR = 30
 TIMER_UPDATE_MS = 1000
 PULSE_UPDATE_MS = 100
+AUTO_SCAN_INTERVAL_MS = 2000  # Check for new log data every 2 seconds
 
 # Colors
 COLOR_EMPTY_BG = "lightgrey"
 COLOR_NORMAL_BG = "white"
 COLOR_RESET_READY = "green"
+
+# Regex patterns for log parsing
+PATTERN_LOGIN = re.compile(r'Vivox - LoginAsync\(([A-Za-z][A-Za-z0-9_]*)\)')
+PATTERN_AREA = re.compile(r'Initializing area! \(\d+\): Area(\w+)')
+PATTERN_INTERACTION = re.compile(r'LocalPlayer: ProcessStartInteraction\((\d+),.*?,.*?,.*?, (NPC_[^,]+),')
+PATTERN_VENDOR_SCREEN = re.compile(r'LocalPlayer: ProcessVendorScreen\((\d+), ([^,]+), (\d+), (\d+), (\d+),')
+PATTERN_VENDOR_UPDATE_GOLD = re.compile(r'LocalPlayer: ProcessVendorUpdateAvailableGold\((\d+), (\d+), (\d+),')
 
 
 # ---------------------
@@ -74,6 +87,22 @@ class TimeUntilReset:
         
         return cls(int(d), int(h), int(m))
     
+    @classmethod
+    def from_reset_timestamp_ms(cls, reset_timestamp_ms: int) -> 'TimeUntilReset':
+        """Create from Unix millisecond timestamp of reset time."""
+        if reset_timestamp_ms == 0:
+            # Vendor just reset, full 7 days
+            return cls(6, 23, 59)
+        
+        reset_time = datetime.fromtimestamp(reset_timestamp_ms / 1000.0)
+        now = datetime.now()
+        td = reset_time - now
+        
+        if td.total_seconds() <= 0:
+            return cls(0, 0, 0)
+        
+        return cls.from_timedelta(td)
+    
     def to_timedelta(self) -> timedelta:
         """Convert to timedelta."""
         return timedelta(days=self.days, hours=self.hours, minutes=self.minutes)
@@ -90,6 +119,286 @@ class TimeUntilReset:
             return datetime.now() - time_since_last_reset
         else:
             return datetime.now() + time_until_reset - timedelta(days=7)
+
+
+@dataclass
+class ScanResult:
+    """Results from scanning the Player.log file."""
+    characters_found: Set[str]
+    npc_mappings: Dict[int, str]  # NPC_ID -> clean name (without NPC_ prefix)
+    npc_zones: Dict[int, str]  # NPC_ID -> zone name
+    vendor_data: Dict[str, Dict[int, Tuple[int, int, int]]]  # character -> {npc_id: (council_left, reset_ts_ms, max_council)}
+    errors: List[str]
+
+
+# ---------------------
+# Log Watcher (Incremental Scanner)
+# ---------------------
+class LogWatcher:
+    """Efficiently watches Player.log for new vendor data by reading only new lines."""
+    
+    def __init__(self, log_path: str, on_update_callback):
+        self.log_path = log_path
+        self.on_update_callback = on_update_callback
+        
+        # File tracking state
+        self.last_position = 0
+        self.last_size = 0
+        self.last_modified = 0
+        
+        # Parsing state (persistent across reads)
+        self.current_character: Optional[str] = None
+        self.current_zone: str = "Unknown"
+        self.current_vendor_npc_id: Optional[int] = None
+        
+        # Accumulated data
+        self.characters_found: Set[str] = set()
+        self.npc_mappings: Dict[int, str] = {}
+        self.npc_zones: Dict[int, str] = {}
+        self.vendor_data: Dict[str, Dict[int, Tuple[int, int, int]]] = {}
+        
+        # Track what changed in last scan
+        self.last_scan_updates: List[Tuple[str, int, str]] = []  # (character, npc_id, npc_name)
+    
+    def check_for_updates(self) -> bool:
+        """
+        Check for new content in the log file.
+        Returns True if new vendor data was found.
+        """
+        if not os.path.exists(self.log_path):
+            return False
+        
+        try:
+            stat = os.stat(self.log_path)
+            current_size = stat.st_size
+            current_modified = stat.st_mtime
+            
+            # Check if file was rotated/truncated (size decreased)
+            if current_size < self.last_size:
+                # File was reset, start from beginning
+                self.last_position = 0
+                self.last_size = 0
+            
+            # Check if there's new content
+            if current_size <= self.last_position:
+                return False
+            
+            # Read only the new content
+            updates_found = self._read_new_content()
+            
+            self.last_size = current_size
+            self.last_modified = current_modified
+            
+            return updates_found
+            
+        except (OSError, IOError) as e:
+            # File might be locked by the game, try again later
+            return False
+    
+    def _read_new_content(self) -> bool:
+        """Read new lines from the log file. Returns True if vendor data was updated."""
+        self.last_scan_updates.clear()
+        updates_found = False
+        
+        try:
+            with open(self.log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                # Seek to last known position
+                f.seek(self.last_position)
+                
+                for line in f:
+                    if self._process_line(line):
+                        updates_found = True
+                
+                # Update position for next read
+                self.last_position = f.tell()
+            
+            return updates_found
+            
+        except (OSError, IOError):
+            return False
+    
+    def _process_line(self, line: str) -> bool:
+        """Process a single log line. Returns True if vendor data was updated."""
+        # Check for character login
+        login_match = PATTERN_LOGIN.search(line)
+        if login_match:
+            char_name = login_match.group(1)
+            if not char_name.isdigit():
+                self.current_character = char_name
+                self.characters_found.add(char_name)
+                if char_name not in self.vendor_data:
+                    self.vendor_data[char_name] = {}
+            return False
+        
+        # Check for area/zone change
+        area_match = PATTERN_AREA.search(line)
+        if area_match:
+            self.current_zone = area_match.group(1)
+            return False
+        
+        # Check for NPC interaction
+        interaction_match = PATTERN_INTERACTION.search(line)
+        if interaction_match:
+            npc_id = int(interaction_match.group(1))
+            npc_name_raw = interaction_match.group(2)
+            npc_name = npc_name_raw[4:] if npc_name_raw.startswith('NPC_') else npc_name_raw
+            self.npc_mappings[npc_id] = npc_name
+            
+            # VendorFox exception
+            if npc_name == 'VendorFox':
+                self.npc_zones[npc_id] = 'Anywhere'
+            else:
+                self.npc_zones[npc_id] = self.current_zone
+            return False
+        
+        # Check for vendor screen (opens vendor)
+        vendor_match = PATTERN_VENDOR_SCREEN.search(line)
+        if vendor_match and self.current_character:
+            npc_id = int(vendor_match.group(1))
+            council_left = int(vendor_match.group(3))
+            reset_ts_ms = int(vendor_match.group(4))
+            max_council = int(vendor_match.group(5))
+            
+            self.vendor_data[self.current_character][npc_id] = (council_left, reset_ts_ms, max_council)
+            self.current_vendor_npc_id = npc_id
+            
+            npc_name = self.npc_mappings.get(npc_id, f"Unknown_{npc_id}")
+            self.last_scan_updates.append((self.current_character, npc_id, npc_name))
+            return True
+        
+        # Check for vendor gold update (after selling)
+        update_match = PATTERN_VENDOR_UPDATE_GOLD.search(line)
+        if update_match and self.current_character and self.current_vendor_npc_id is not None:
+            council_left = int(update_match.group(1))
+            reset_ts_ms = int(update_match.group(2))
+            max_council = int(update_match.group(3))
+            
+            self.vendor_data[self.current_character][self.current_vendor_npc_id] = (council_left, reset_ts_ms, max_council)
+            
+            npc_name = self.npc_mappings.get(self.current_vendor_npc_id, f"Unknown_{self.current_vendor_npc_id}")
+            self.last_scan_updates.append((self.current_character, self.current_vendor_npc_id, npc_name))
+            return True
+        
+        return False
+    
+    def get_scan_result(self) -> ScanResult:
+        """Get current accumulated data as a ScanResult."""
+        return ScanResult(
+            self.characters_found.copy(),
+            self.npc_mappings.copy(),
+            self.npc_zones.copy(),
+            {char: vendors.copy() for char, vendors in self.vendor_data.items()},
+            []
+        )
+    
+    def reset(self):
+        """Reset the watcher to re-read from the beginning."""
+        self.last_position = 0
+        self.last_size = 0
+        self.current_character = None
+        self.current_zone = "Unknown"
+        self.current_vendor_npc_id = None
+
+
+# ---------------------
+# Log Scanner (Full File Scan)
+# ---------------------
+class PlayerLogScanner:
+    """Scans Player.log to extract vendor information."""
+    
+    def __init__(self, log_path: str):
+        self.log_path = log_path
+    
+    def scan(self) -> ScanResult:
+        """Scan the log file and extract vendor data."""
+        characters_found: Set[str] = set()
+        npc_mappings: Dict[int, str] = {}
+        npc_zones: Dict[int, str] = {}
+        vendor_data: Dict[str, Dict[int, Tuple[int, int, int]]] = {}
+        errors: List[str] = []
+        
+        current_character: Optional[str] = None
+        current_zone: str = "Unknown"
+        current_vendor_npc_id: Optional[int] = None  # Track the currently open vendor
+        
+        if not os.path.exists(self.log_path):
+            errors.append(f"Log file not found: {self.log_path}")
+            return ScanResult(characters_found, npc_mappings, npc_zones, vendor_data, errors)
+        
+        try:
+            with open(self.log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line_num, line in enumerate(f, 1):
+                    try:
+                        # Check for character login
+                        login_match = PATTERN_LOGIN.search(line)
+                        if login_match:
+                            char_name = login_match.group(1)
+                            # Skip numeric IDs (like Steam IDs)
+                            if not char_name.isdigit():
+                                current_character = char_name
+                                characters_found.add(char_name)
+                                if char_name not in vendor_data:
+                                    vendor_data[char_name] = {}
+                            continue
+                        
+                        # Check for area/zone change
+                        area_match = PATTERN_AREA.search(line)
+                        if area_match:
+                            current_zone = area_match.group(1)
+                            continue
+                        
+                        # Check for NPC interaction (mapping ID to name and zone)
+                        interaction_match = PATTERN_INTERACTION.search(line)
+                        if interaction_match:
+                            npc_id = int(interaction_match.group(1))
+                            npc_name_raw = interaction_match.group(2)
+                            # Remove NPC_ prefix if present
+                            if npc_name_raw.startswith('NPC_'):
+                                npc_name = npc_name_raw[4:]
+                            else:
+                                npc_name = npc_name_raw
+                            npc_mappings[npc_id] = npc_name
+                            # Associate zone with this NPC (VendorFox is special - can be anywhere)
+                            if npc_name == 'VendorFox':
+                                npc_zones[npc_id] = 'Anywhere'
+                            else:
+                                npc_zones[npc_id] = current_zone
+                            continue
+                        
+                        # Check for vendor screen (council data) - this opens a vendor
+                        vendor_match = PATTERN_VENDOR_SCREEN.search(line)
+                        if vendor_match and current_character:
+                            npc_id = int(vendor_match.group(1))
+                            # group(2) is category like SoulMates - not used
+                            council_left = int(vendor_match.group(3))
+                            reset_ts_ms = int(vendor_match.group(4))
+                            max_council = int(vendor_match.group(5))
+                            
+                            # Store vendor data for current character
+                            vendor_data[current_character][npc_id] = (council_left, reset_ts_ms, max_council)
+                            
+                            # Track this as the currently open vendor
+                            current_vendor_npc_id = npc_id
+                            continue
+                        
+                        # Check for vendor gold update (after selling items)
+                        update_match = PATTERN_VENDOR_UPDATE_GOLD.search(line)
+                        if update_match and current_character and current_vendor_npc_id is not None:
+                            council_left = int(update_match.group(1))
+                            reset_ts_ms = int(update_match.group(2))
+                            max_council = int(update_match.group(3))
+                            
+                            # Update the currently open vendor's data
+                            vendor_data[current_character][current_vendor_npc_id] = (council_left, reset_ts_ms, max_council)
+                            continue
+                    
+                    except Exception as e:
+                        errors.append(f"Line {line_num}: {str(e)}")
+        
+        except Exception as e:
+            errors.append(f"Error reading log file: {str(e)}")
+        
+        return ScanResult(characters_found, npc_mappings, npc_zones, vendor_data, errors)
 
 
 # ---------------------
@@ -117,26 +426,41 @@ class VendorDatabase:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
+                
+                # NPC ID to Name mapping table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS npc_mappings (
+                        npc_id INTEGER PRIMARY KEY,
+                        npc_name TEXT NOT NULL,
+                        zone TEXT DEFAULT '',
+                        last_updated TEXT NOT NULL
+                    )
+                ''')
+                
+                # Vendors table (per character)
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS vendors (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         character_name TEXT NOT NULL,
-                        name TEXT NOT NULL,
+                        npc_id INTEGER NOT NULL,
+                        npc_name TEXT NOT NULL,
                         zone TEXT NOT NULL,
                         council_left INTEGER NOT NULL,
                         last_reset TEXT NOT NULL,
                         reset_maximum INTEGER NOT NULL,
                         categories TEXT NOT NULL,
                         muted BOOLEAN NOT NULL,
-                        UNIQUE(character_name, name)
+                        UNIQUE(character_name, npc_id)
                     )
                 ''')
                 
+                # Transactions table
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS transactions (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         character_name TEXT NOT NULL,
                         vendor_name TEXT NOT NULL,
+                        npc_id INTEGER,
                         transaction_type TEXT NOT NULL,
                         council_before INTEGER NOT NULL,
                         council_after INTEGER NOT NULL,
@@ -151,9 +475,63 @@ class VendorDatabase:
                     ON transactions(character_name, vendor_name, timestamp)
                 ''')
                 
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_vendors_character 
+                    ON vendors(character_name)
+                ''')
+                
                 conn.commit()
         except sqlite3.Error as e:
             raise RuntimeError(f"Could not initialize database: {e}")
+    
+    def save_npc_mapping(self, npc_id: int, npc_name: str, zone: str = ''):
+        """Save or update NPC ID to name mapping."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO npc_mappings (npc_id, npc_name, zone, last_updated)
+                    VALUES (?, ?, ?, ?)
+                ''', (npc_id, npc_name, zone, datetime.now().isoformat()))
+                conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error saving NPC mapping: {e}")
+    
+    def get_npc_name(self, npc_id: int) -> Optional[str]:
+        """Get NPC name from ID."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT npc_name FROM npc_mappings WHERE npc_id = ?', (npc_id,))
+                row = cursor.fetchone()
+                return row[0] if row else None
+        except sqlite3.Error as e:
+            print(f"Error getting NPC name: {e}")
+            return None
+    
+    def get_npc_zone(self, npc_id: int) -> str:
+        """Get NPC zone from ID."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT zone FROM npc_mappings WHERE npc_id = ?', (npc_id,))
+                row = cursor.fetchone()
+                return row[0] if row and row[0] else 'Unknown'
+        except sqlite3.Error as e:
+            print(f"Error getting NPC zone: {e}")
+            return 'Unknown'
+    
+    def update_npc_zone(self, npc_id: int, zone: str):
+        """Update zone for an NPC."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE npc_mappings SET zone = ?, last_updated = ? WHERE npc_id = ?
+                ''', (zone, datetime.now().isoformat(), npc_id))
+                conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error updating NPC zone: {e}")
     
     def save_vendors(self, vendors: List['Vendor'], character_name: str):
         """Save vendors for a character."""
@@ -164,11 +542,12 @@ class VendorDatabase:
                 for vendor in vendors:
                     cursor.execute('''
                         INSERT INTO vendors (
-                            character_name, name, zone, council_left,
+                            character_name, npc_id, npc_name, zone, council_left,
                             last_reset, reset_maximum, categories, muted
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         character_name,
+                        vendor.npc_id,
                         vendor.name,
                         vendor.zone,
                         vendor.council_left,
@@ -187,31 +566,76 @@ class VendorDatabase:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT name, zone, council_left, last_reset, 
+                    SELECT npc_id, npc_name, zone, council_left, last_reset, 
                            reset_maximum, categories, muted 
                     FROM vendors WHERE character_name = ?
                 ''', (character_name,))
                 rows = cursor.fetchall()
                 
                 vendors = []
+                vendor_fox_entry = None
+                
                 for row in rows:
                     try:
                         vendor = Vendor(
-                            name=row[0],
-                            zone=row[1],
-                            council_left=row[2],
-                            last_reset=row[3],
-                            reset_maximum=row[4],
-                            categories=json.loads(row[5]),
-                            muted=row[6]
+                            npc_id=row[0],
+                            name=row[1],
+                            zone=row[2],
+                            council_left=row[3],
+                            last_reset=row[4],
+                            reset_maximum=row[5],
+                            categories=json.loads(row[6]),
+                            muted=row[7]
                         )
-                        vendors.append(vendor)
+                        
+                        # Consolidate VendorFox - keep the one with latest reset time
+                        if vendor.name == 'VendorFox':
+                            if vendor_fox_entry is None:
+                                vendor_fox_entry = vendor
+                            else:
+                                # Keep the one with more recent last_reset
+                                if vendor.last_reset > vendor_fox_entry.last_reset:
+                                    vendor_fox_entry = vendor
+                        else:
+                            vendors.append(vendor)
                     except (ValueError, json.JSONDecodeError) as e:
-                        print(f"Error loading vendor {row[0]}: {e}")
+                        print(f"Error loading vendor {row[1]}: {e}")
+                
+                # Add consolidated VendorFox if found
+                if vendor_fox_entry is not None:
+                    vendors.append(vendor_fox_entry)
                 
                 return vendors
         except sqlite3.Error as e:
             raise RuntimeError(f"Could not load vendors for {character_name}: {e}")
+    
+    def get_vendor_by_npc_id(self, character_name: str, npc_id: int) -> Optional['Vendor']:
+        """Get a specific vendor by NPC ID."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT npc_id, npc_name, zone, council_left, last_reset, 
+                           reset_maximum, categories, muted 
+                    FROM vendors WHERE character_name = ? AND npc_id = ?
+                ''', (character_name, npc_id))
+                row = cursor.fetchone()
+                
+                if row:
+                    return Vendor(
+                        npc_id=row[0],
+                        name=row[1],
+                        zone=row[2],
+                        council_left=row[3],
+                        last_reset=row[4],
+                        reset_maximum=row[5],
+                        categories=json.loads(row[6]),
+                        muted=row[7]
+                    )
+                return None
+        except sqlite3.Error as e:
+            print(f"Error getting vendor: {e}")
+            return None
     
     def get_all_characters(self) -> List[str]:
         """Get all unique character names."""
@@ -229,7 +653,8 @@ class VendorDatabase:
     
     def log_transaction(self, character_name: str, vendor_name: str, 
                         transaction_type: str, council_before: int, 
-                        council_after: int, notes: Optional[str] = None):
+                        council_after: int, notes: Optional[str] = None,
+                        npc_id: Optional[int] = None):
         """Log a transaction."""
         try:
             council_change = council_after - council_before
@@ -237,12 +662,12 @@ class VendorDatabase:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO transactions (
-                        character_name, vendor_name, transaction_type,
+                        character_name, vendor_name, npc_id, transaction_type,
                         council_before, council_after, council_change,
                         timestamp, notes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    character_name, vendor_name, transaction_type,
+                    character_name, vendor_name, npc_id, transaction_type,
                     council_before, council_after, council_change,
                     datetime.now().isoformat(), notes
                 ))
@@ -273,7 +698,7 @@ class VendorDatabase:
         cursor.execute('''
             SELECT SUM(ABS(council_change)) FROM transactions
             WHERE character_name = ? AND vendor_name = ?
-            AND timestamp >= ? AND transaction_type IN ('purchase', 'adjustment')
+            AND timestamp >= ? AND transaction_type IN ('purchase', 'adjustment', 'scan_update')
             AND council_change < 0
         ''', (character_name, vendor_name, cutoff_date))
         result = cursor.fetchone()
@@ -281,7 +706,7 @@ class VendorDatabase:
         
         cursor.execute('''
             SELECT council_left, reset_maximum FROM vendors
-            WHERE character_name = ? AND name = ?
+            WHERE character_name = ? AND npc_name = ?
         ''', (character_name, vendor_name))
         vendor_row = cursor.fetchone()
         
@@ -304,7 +729,7 @@ class VendorDatabase:
         """Calculate earned for all vendors."""
         total_earned = 0
         cursor.execute('''
-            SELECT name, council_left, reset_maximum FROM vendors
+            SELECT npc_name, council_left, reset_maximum FROM vendors
             WHERE character_name = ?
         ''', (character_name,))
         vendors = cursor.fetchall()
@@ -313,7 +738,7 @@ class VendorDatabase:
             cursor.execute('''
                 SELECT SUM(ABS(council_change)) FROM transactions
                 WHERE character_name = ? AND vendor_name = ?
-                AND timestamp >= ? AND transaction_type IN ('purchase', 'adjustment')
+                AND timestamp >= ? AND transaction_type IN ('purchase', 'adjustment', 'scan_update')
                 AND council_change < 0
             ''', (character_name, vendor_name, cutoff_date))
             result = cursor.fetchone()
@@ -366,6 +791,51 @@ class VendorDatabase:
 
 
 # ---------------------
+# Settings Manager
+# ---------------------
+class SettingsManager:
+    """Manages application settings."""
+    
+    def __init__(self, settings_path: str):
+        self.settings_path = settings_path
+        self.settings = self._load_settings()
+    
+    def _load_settings(self) -> Dict:
+        """Load settings from file."""
+        default_settings = {
+            'log_path': DEFAULT_LOG_PATH
+        }
+        
+        if os.path.exists(self.settings_path):
+            try:
+                with open(self.settings_path, 'r') as f:
+                    loaded = json.load(f)
+                    default_settings.update(loaded)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"Error loading settings: {e}")
+        
+        return default_settings
+    
+    def save_settings(self):
+        """Save settings to file."""
+        try:
+            os.makedirs(os.path.dirname(self.settings_path), exist_ok=True)
+            with open(self.settings_path, 'w') as f:
+                json.dump(self.settings, f, indent=2)
+        except IOError as e:
+            print(f"Error saving settings: {e}")
+    
+    def get(self, key: str, default=None):
+        """Get a setting value."""
+        return self.settings.get(key, default)
+    
+    def set(self, key: str, value):
+        """Set a setting value."""
+        self.settings[key] = value
+        self.save_settings()
+
+
+# ---------------------
 # Vendor Model
 # ---------------------
 class Vendor:
@@ -374,7 +844,9 @@ class Vendor:
     def __init__(self, name: str, zone: str, council_left: int, 
                  last_reset, reset_maximum: int = 0, 
                  categories: Optional[List[str]] = None, 
-                 muted: bool = False):
+                 muted: bool = False,
+                 npc_id: int = 0):
+        self.npc_id = npc_id
         self.name = name
         self.zone = zone
         self.council_left = int(council_left)
@@ -401,6 +873,29 @@ class Vendor:
             print(f"Warning: Unknown last_reset type for {vendor_name}, using current time")
             return datetime.now()
     
+    @classmethod
+    def from_scan_data(cls, npc_id: int, npc_name: str, zone: str,
+                       council_left: int, reset_ts_ms: int, max_council: int) -> 'Vendor':
+        """Create a Vendor from scanned log data."""
+        if reset_ts_ms == 0:
+            # Vendor at full, assume just reset (or within 7 days)
+            last_reset = datetime.now()
+        else:
+            # Calculate last reset from the reset timestamp
+            reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
+            last_reset = reset_time - timedelta(days=7)
+        
+        return cls(
+            npc_id=npc_id,
+            name=npc_name,
+            zone=zone,
+            council_left=council_left,
+            last_reset=last_reset,
+            reset_maximum=max_council,
+            categories=[],
+            muted=False
+        )
+    
     @property
     def next_reset(self) -> datetime:
         """Calculate next reset time."""
@@ -421,7 +916,6 @@ class Vendor:
         """Get time until next reset."""
         return TimeUntilReset.from_timedelta(self.next_reset - datetime.now())
     
-    # --- MODIFIED: Enhanced Multi-Term Search Logic ---
     def matches_filter(self, filter_text: str) -> bool:
         """
         Check if vendor matches filter text.
@@ -430,17 +924,13 @@ class Vendor:
         if not filter_text:
             return True
 
-        # Split the search query into individual terms
         search_terms = filter_text.lower().split()
-
-        # Combine all searchable vendor attributes into a single string for easy searching
         vendor_info = " ".join([
             self.name.lower(),
             self.zone.lower(),
             *map(str.lower, self.categories)
         ])
 
-        # Check if ALL search terms are present in the combined info string
         return all(term in vendor_info for term in search_terms)
 
 
@@ -492,10 +982,25 @@ def calculate_pulse_color(frame: int) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def format_reset_countdown(reset_ts_ms: int) -> str:
+    """Format reset timestamp as countdown string."""
+    if reset_ts_ms == 0:
+        return "Full (recently reset)"
+    
+    reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
+    now = datetime.now()
+    td = reset_time - now
+    
+    if td.total_seconds() <= 0:
+        return "Ready to reset!"
+    
+    time_obj = TimeUntilReset.from_timedelta(td)
+    return f"Resets in: {time_obj.to_string()}"
+
+
 # ---------------------
 # UI Components
 # ---------------------
-# --- MODIFIED: Reliable Scrolling Logic ---
 class ScrollableFrame(tk.Frame):
     """
     A reusable scrollable frame component that handles mousewheel scrolling reliably
@@ -519,29 +1024,23 @@ class ScrollableFrame(tk.Frame):
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
 
-        # Bind mousewheel events only when the cursor is over this specific frame
         self.bind('<Enter>', self._bind_mousewheel)
         self.bind('<Leave>', self._unbind_mousewheel)
 
     def _on_mousewheel(self, event):
         """Handle mousewheel scrolling, compatible with Windows, macOS, and Linux."""
         try:
-            # Windows and macOS use event.delta
             if hasattr(event, 'delta'):
                 self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            # Linux uses event.num for scrolling up (4) and down (5)
             elif event.num == 4:
                 self.canvas.yview_scroll(-1, "units")
             elif event.num == 5:
                 self.canvas.yview_scroll(1, "units")
         except tk.TclError:
-            # This exception can occur if the widget is destroyed during a scroll event
             pass
 
     def _bind_mousewheel(self, event):
         """Bind mousewheel events when the mouse enters the frame."""
-        # Using bind_all ensures that scrolling works even if the mouse
-        # is over a child widget (like a button or label) inside the frame.
         self.bind_all("<MouseWheel>", self._on_mousewheel)
         self.bind_all("<Button-4>", self._on_mousewheel)
         self.bind_all("<Button-5>", self._on_mousewheel)
@@ -583,6 +1082,10 @@ class VendorForm:
             Label(form_frame, text=f"Updating {self.vendor.name} ({self.vendor.zone})").pack(
                 padx=10, pady=(8,2), anchor="w"
             )
+            if self.vendor.npc_id:
+                Label(form_frame, text=f"NPC ID: {self.vendor.npc_id}", fg="gray").pack(
+                    padx=10, pady=(0,2), anchor="w"
+                )
         
         self._create_council_field(form_frame)
         self._create_time_fields(form_frame)
@@ -617,22 +1120,18 @@ class VendorForm:
         label_text = "Update reset time:" if self.is_update else "Time until reset:"
         Label(time_frame, text=label_text).pack(side=tk.LEFT)
         
-        # Days
         Label(time_frame, text="Days:").pack(side=tk.LEFT, padx=(8,0))
         self.days_entry = Entry(time_frame, width=5)
         self.days_entry.pack(side=tk.LEFT, padx=2)
         
-        # Hours
         Label(time_frame, text="Hours:").pack(side=tk.LEFT, padx=(8,0))
         self.hours_entry = Entry(time_frame, width=5)
         self.hours_entry.pack(side=tk.LEFT, padx=2)
         
-        # Minutes
         Label(time_frame, text="Minutes:").pack(side=tk.LEFT, padx=(8,0))
         self.minutes_entry = Entry(time_frame, width=5)
         self.minutes_entry.pack(side=tk.LEFT, padx=2)
         
-        # Set initial values
         if self.vendor:
             time_obj = self.vendor.time_until_reset
             self.days_entry.insert(0, str(max(0, time_obj.days)))
@@ -648,7 +1147,6 @@ class VendorForm:
         cat_override_row = tk.Frame(parent)
         cat_override_row.pack(padx=10, pady=6, anchor="w", fill=tk.X)
         
-        # Left options
         left_options = tk.Frame(cat_override_row)
         left_options.pack(side=tk.LEFT, padx=(0,12), anchor="n")
         
@@ -659,7 +1157,6 @@ class VendorForm:
         Checkbutton(left_options, text=mute_text, 
                     variable=self.muted_var).pack(anchor="w")
         
-        # Categories
         cat_area_frame = tk.Frame(cat_override_row)
         cat_area_frame.pack(side=tk.LEFT, anchor="n")
         Label(cat_area_frame, text="Categories:").pack(anchor="w")
@@ -674,7 +1171,6 @@ class VendorForm:
             cb = Checkbutton(cat_frame, text=c, variable=self.cat_vars[c])
             cb.grid(row=r, column=col, sticky="w", padx=8, pady=4)
         
-        # Custom category
         custom_wrap = tk.Frame(cat_frame)
         custom_wrap.grid(row=1, column=2, sticky="w", padx=8, pady=4)
         cb_custom = Checkbutton(custom_wrap, text="Custom:", variable=self.custom_var)
@@ -682,7 +1178,6 @@ class VendorForm:
         self.custom_entry = Entry(custom_wrap, width=18)
         self.custom_entry.pack(side=tk.LEFT, padx=4)
         
-        # Populate custom categories
         if self.vendor:
             custom_items = [c for c in self.vendor.categories if c not in VENDOR_CATEGORIES]
             if custom_items:
@@ -693,7 +1188,6 @@ class VendorForm:
         """Extract and validate form values."""
         values = {}
         
-        # Name and zone (for add mode)
         if not self.is_update:
             values['name'] = self.name_entry.get().strip()
             values['zone'] = self.zone_entry.get().strip()
@@ -701,14 +1195,12 @@ class VendorForm:
             if not values['name']:
                 raise ValueError("Vendor name cannot be empty.")
         
-        # Council
         try:
             council_input = float(self.council_entry.get() or 0)
             values['council'] = int(council_input * 1000)
         except (ValueError, TypeError):
             raise ValueError("Council must be numeric (K).")
         
-        # Time inputs
         try:
             values['days'] = int(self.days_entry.get() or 0)
             values['hours'] = int(self.hours_entry.get() or 0)
@@ -716,7 +1208,6 @@ class VendorForm:
         except (ValueError, TypeError):
             raise ValueError("Days, Hours, Minutes must be integers.")
         
-        # Validate time
         override_flag = self.max_time_override_var.get()
         total_minutes = values['days'] * 24 * 60 + values['hours'] * 60 + values['minutes']
         if total_minutes > MAX_TOTAL_MINUTES and not override_flag:
@@ -725,7 +1216,6 @@ class VendorForm:
         values['override_max_time'] = override_flag
         values['muted'] = self.muted_var.get()
         
-        # Categories
         selected_cats = [c for c, var in self.cat_vars.items() if var.get()]
         if self.custom_var.get():
             cv = self.custom_entry.get().strip()
@@ -733,7 +1223,6 @@ class VendorForm:
                 extras = [x.strip() for x in cv.split(",") if x.strip()]
                 selected_cats.extend(extras)
         
-        # Remove duplicates while preserving order
         seen = set()
         final_cats = []
         for c in selected_cats:
@@ -767,16 +1256,13 @@ class VendorCard:
         border_color = calculate_border_color(self.vendor, min_time, max_time)
         bg_color = COLOR_EMPTY_BG if (self.vendor.is_empty and not self.vendor.is_ready_to_reset) else COLOR_NORMAL_BG
         
-        # Outer frame with colored border
         self.outer_frame = tk.Frame(self.parent, bg=border_color)
         self.outer_frame.pack(fill=tk.X, padx=4, pady=4)
         self.outer_frame.vendor_name = self.vendor.name
         
-        # Inner frame
         vf = tk.Frame(self.outer_frame, bg=bg_color)
         vf.pack(padx=2, pady=2, fill=tk.X)
         
-        # Info section
         info = tk.Frame(vf, bg=bg_color)
         info.pack(fill=tk.X, padx=4, pady=2)
         
@@ -794,13 +1280,11 @@ class VendorCard:
         council_label = Label(left_info, text=council_str, bg=bg_color)
         council_label.pack(anchor="w")
         
-        # Time label
         time_str = self._get_time_string()
         self.time_label = Label(info, text=time_str, bg=bg_color)
         self.time_label.pack(side=tk.RIGHT, anchor="e")
         self.outer_frame.time_label = self.time_label
         
-        # Buttons
         btns = tk.Frame(vf, bg=bg_color)
         btns.pack(fill=tk.X, padx=4, pady=2)
         
@@ -814,7 +1298,6 @@ class VendorCard:
         Button(btns, text=mute_text, 
                command=lambda: self.callbacks['toggle_mute'](self.vendor)).pack(side=tk.LEFT, padx=5, pady=2)
         
-        # Track widgets for pulse animation
         if self.vendor.is_empty and self.vendor.is_ready_to_reset and not self.vendor.muted:
             self.widgets_for_pulse = [vf, info, left_info, name_label, council_label, self.time_label, btns]
     
@@ -851,7 +1334,6 @@ class TransactionWindow:
     
     def _create_ui(self):
         """Create the transaction window UI."""
-        # Controls
         controls = tk.Frame(self.window)
         controls.pack(fill=tk.X, padx=10, pady=10)
         
@@ -860,16 +1342,13 @@ class TransactionWindow:
         days_entry.pack(side=tk.LEFT, padx=5)
         Button(controls, text="Refresh", command=self.refresh_transactions).pack(side=tk.LEFT, padx=5)
         
-        # Notebook with tabs
         notebook = ttk.Notebook(self.window)
         notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Transaction list tab
         trans_tab = ScrollableFrame(notebook)
         notebook.add(trans_tab, text="Transaction List")
         self.trans_frame = trans_tab.scrollable_frame
         
-        # Daily earnings tab
         daily_tab = ScrollableFrame(notebook)
         notebook.add(daily_tab, text="Daily Earnings")
         self.daily_frame = daily_tab.scrollable_frame
@@ -893,7 +1372,8 @@ class TransactionWindow:
         
         total_earned = 0
         for trans in transactions:
-            trans_id, char, vendor, trans_type, before, after, change, timestamp, notes = trans
+            # Updated to handle npc_id column
+            trans_id, char, vendor, npc_id, trans_type, before, after, change, timestamp, notes = trans
             if change > 0:
                 total_earned += change
             
@@ -917,19 +1397,16 @@ class TransactionWindow:
         for widget in self.daily_frame.winfo_children():
             widget.destroy()
         
-        # Calculate daily earnings
         daily_earnings = defaultdict(int)
         for trans in transactions:
-            trans_id, char, vendor, trans_type, before, after, change, timestamp, notes = trans
+            trans_id, char, vendor, npc_id, trans_type, before, after, change, timestamp, notes = trans
             if change < 0:
                 dt = datetime.fromisoformat(timestamp)
                 date_key = dt.date()
                 daily_earnings[date_key] += abs(change)
         
-        # Create date list
         all_dates = [(datetime.now() - timedelta(days=i)).date() for i in range(days)]
         
-        # Headers
         Label(self.daily_frame, text="Daily Council Earned", 
               font=("Arial", 12, "bold")).grid(row=0, column=0, columnspan=2, padx=5, pady=10, sticky="w")
         
@@ -938,7 +1415,6 @@ class TransactionWindow:
         Label(self.daily_frame, text="Council Earned", font=("Arial", 10, "bold"), 
               anchor="e", relief="solid", borderwidth=1, padx=5, pady=3).grid(row=1, column=1, sticky="ew")
         
-        # Data rows
         total_daily = 0
         row = 2
         for date in all_dates:
@@ -957,11 +1433,292 @@ class TransactionWindow:
                   font=("Arial", 10), relief="solid", borderwidth=1, padx=5, pady=3).grid(row=row, column=1, sticky="ew")
             row += 1
         
-        # Total row
         Label(self.daily_frame, text="Total:", font=("Arial", 10, "bold"), 
               anchor="w", relief="solid", borderwidth=1, padx=5, pady=3).grid(row=row, column=0, sticky="ew")
         Label(self.daily_frame, text=f"{format_number(total_daily)}", 
               font=("Arial", 10, "bold"), anchor="e", relief="solid", borderwidth=1, padx=5, pady=3).grid(row=row, column=1, sticky="ew")
+
+
+# ---------------------
+# Scan Results Window
+# ---------------------
+class ScanResultsWindow:
+    """Window for displaying and selecting scan results."""
+    
+    def __init__(self, parent, scan_result: ScanResult, db: VendorDatabase, 
+                 current_character: str, on_import_callback):
+        self.parent = parent
+        self.scan_result = scan_result
+        self.db = db
+        self.current_character = current_character
+        self.on_import_callback = on_import_callback
+        
+        self.window = Toplevel(parent)
+        self.window.title("Scan Results")
+        self.window.geometry("900x600")
+        
+        self.char_var = StringVar()
+        self.vendor_vars = {}  # npc_id -> BooleanVar
+        
+        self._create_ui()
+    
+    def _create_ui(self):
+        """Create the scan results UI."""
+        # Top section - character selection
+        top_frame = tk.Frame(self.window)
+        top_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        Label(top_frame, text="Characters found in log:", font=("Arial", 10, "bold")).pack(anchor="w")
+        
+        chars_found = sorted(self.scan_result.characters_found)
+        if not chars_found:
+            Label(top_frame, text="No characters found in log file.", fg="red").pack(anchor="w")
+            return
+        
+        # Character selector
+        char_frame = tk.Frame(top_frame)
+        char_frame.pack(fill=tk.X, pady=5)
+        Label(char_frame, text="Import data for character:").pack(side=tk.LEFT)
+        
+        # Default to current character if found, otherwise first found
+        default_char = self.current_character if self.current_character in chars_found else chars_found[0]
+        self.char_var.set(default_char)
+        
+        char_menu = OptionMenu(char_frame, self.char_var, *chars_found, command=self._on_char_select)
+        char_menu.pack(side=tk.LEFT, padx=5)
+        
+        # Stats
+        stats_text = f"Found {len(self.scan_result.npc_mappings)} NPCs, {len(chars_found)} characters"
+        Label(top_frame, text=stats_text, fg="gray").pack(anchor="w")
+        
+        # Vendor list
+        Label(self.window, text="Vendors with data:", font=("Arial", 10, "bold")).pack(padx=10, anchor="w")
+        
+        list_frame = ScrollableFrame(self.window)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.vendor_list_frame = list_frame.scrollable_frame
+        
+        self._populate_vendor_list()
+        
+        # Buttons
+        btn_frame = tk.Frame(self.window)
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        Button(btn_frame, text="Select All", command=self._select_all).pack(side=tk.LEFT, padx=5)
+        Button(btn_frame, text="Deselect All", command=self._deselect_all).pack(side=tk.LEFT, padx=5)
+        Button(btn_frame, text="Import Selected", command=self._import_selected, 
+               bg="green", fg="white").pack(side=tk.RIGHT, padx=5)
+        Button(btn_frame, text="Cancel", command=self.window.destroy).pack(side=tk.RIGHT, padx=5)
+        
+        # Errors section
+        if self.scan_result.errors:
+            error_frame = tk.Frame(self.window)
+            error_frame.pack(fill=tk.X, padx=10, pady=5)
+            Label(error_frame, text=f"Warnings ({len(self.scan_result.errors)}):", fg="orange").pack(anchor="w")
+            error_text = "; ".join(self.scan_result.errors[:5])
+            if len(self.scan_result.errors) > 5:
+                error_text += f"... and {len(self.scan_result.errors) - 5} more"
+            Label(error_frame, text=error_text, fg="gray", wraplength=850).pack(anchor="w")
+    
+    def _populate_vendor_list(self):
+        """Populate the vendor list for selected character."""
+        for widget in self.vendor_list_frame.winfo_children():
+            widget.destroy()
+        self.vendor_vars.clear()
+        
+        char = self.char_var.get()
+        if char not in self.scan_result.vendor_data:
+            Label(self.vendor_list_frame, text="No vendor data for this character.").pack(anchor="w")
+            return
+        
+        vendor_data = self.scan_result.vendor_data[char]
+        
+        # Sort by NPC name
+        sorted_vendors = []
+        for npc_id, (council_left, reset_ts_ms, max_council) in vendor_data.items():
+            npc_name = self.scan_result.npc_mappings.get(npc_id, f"Unknown_{npc_id}")
+            zone = self.scan_result.npc_zones.get(npc_id, "Unknown")
+            sorted_vendors.append((npc_name, npc_id, council_left, reset_ts_ms, max_council, zone))
+        sorted_vendors.sort(key=lambda x: x[0])
+        
+        for npc_name, npc_id, council_left, reset_ts_ms, max_council, zone in sorted_vendors:
+            row_frame = tk.Frame(self.vendor_list_frame)
+            row_frame.pack(fill=tk.X, pady=2)
+            
+            var = BooleanVar(value=True)
+            self.vendor_vars[npc_id] = var
+            
+            cb = Checkbutton(row_frame, variable=var)
+            cb.pack(side=tk.LEFT)
+            
+            # Vendor info with zone
+            info_text = f"{npc_name} ({zone})"
+            Label(row_frame, text=info_text, font=("Arial", 10, "bold"), width=30, anchor="w").pack(side=tk.LEFT)
+            
+            council_text = f"Council: {format_number(council_left)} / {format_number(max_council)}"
+            Label(row_frame, text=council_text, width=20, anchor="w").pack(side=tk.LEFT)
+            
+            reset_text = format_reset_countdown(reset_ts_ms)
+            Label(row_frame, text=reset_text, fg="blue", width=25, anchor="w").pack(side=tk.LEFT)
+    
+    def _on_char_select(self, *args):
+        """Handle character selection change."""
+        self._populate_vendor_list()
+    
+    def _select_all(self):
+        """Select all vendors."""
+        for var in self.vendor_vars.values():
+            var.set(True)
+    
+    def _deselect_all(self):
+        """Deselect all vendors."""
+        for var in self.vendor_vars.values():
+            var.set(False)
+    
+    def _import_selected(self):
+        """Import selected vendors."""
+        char = self.char_var.get()
+        selected_ids = [npc_id for npc_id, var in self.vendor_vars.items() if var.get()]
+        
+        if not selected_ids:
+            messagebox.showwarning("No Selection", "Please select at least one vendor to import.", parent=self.window)
+            return
+        
+        # Save NPC mappings and zones first
+        for npc_id, npc_name in self.scan_result.npc_mappings.items():
+            zone = self.scan_result.npc_zones.get(npc_id, '')
+            self.db.save_npc_mapping(npc_id, npc_name, zone)
+        
+        # Import vendor data
+        imported = 0
+        updated = 0
+        
+        for npc_id in selected_ids:
+            if npc_id not in self.scan_result.vendor_data.get(char, {}):
+                continue
+            
+            council_left, reset_ts_ms, max_council = self.scan_result.vendor_data[char][npc_id]
+            npc_name = self.scan_result.npc_mappings.get(npc_id, f"Unknown_{npc_id}")
+            zone = self.scan_result.npc_zones.get(npc_id, self.db.get_npc_zone(npc_id))
+            
+            # Check if vendor exists
+            existing = self.db.get_vendor_by_npc_id(char, npc_id)
+            
+            if existing:
+                # Update existing vendor
+                old_council = existing.council_left
+                
+                # Calculate last reset from timestamp
+                if reset_ts_ms == 0:
+                    existing.last_reset = datetime.now()
+                else:
+                    reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
+                    existing.last_reset = reset_time - timedelta(days=7)
+                
+                existing.council_left = council_left
+                if max_council > existing.reset_maximum:
+                    existing.reset_maximum = max_council
+                
+                # Update zone if we have new zone data
+                if zone and zone != 'Unknown':
+                    existing.zone = zone
+                
+                # Log transaction if council changed
+                if old_council != council_left:
+                    self.db.log_transaction(
+                        char, npc_name, 'scan_update',
+                        old_council, council_left,
+                        f"Auto-scan update: {format_number(old_council)} → {format_number(council_left)}",
+                        npc_id
+                    )
+                
+                updated += 1
+            else:
+                # Create new vendor
+                imported += 1
+        
+        # Trigger callback to refresh
+        self.on_import_callback(char, selected_ids, self.scan_result)
+        
+        messagebox.showinfo(
+            "Import Complete", 
+            f"Imported {imported} new vendors, updated {updated} existing vendors for {char}.",
+            parent=self.window
+        )
+        self.window.destroy()
+
+
+# ---------------------
+# Settings Window
+# ---------------------
+class SettingsWindow:
+    """Window for application settings."""
+    
+    def __init__(self, parent, settings: SettingsManager, on_save_callback):
+        self.parent = parent
+        self.settings = settings
+        self.on_save_callback = on_save_callback
+        
+        self.window = Toplevel(parent)
+        self.window.title("Settings")
+        self.window.geometry("600x200")
+        
+        self.log_path_var = StringVar(value=settings.get('log_path', DEFAULT_LOG_PATH))
+        
+        self._create_ui()
+    
+    def _create_ui(self):
+        """Create settings UI."""
+        # Log path
+        path_frame = tk.Frame(self.window)
+        path_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        Label(path_frame, text="Player.log Path:", font=("Arial", 10, "bold")).pack(anchor="w")
+        
+        entry_frame = tk.Frame(path_frame)
+        entry_frame.pack(fill=tk.X, pady=5)
+        
+        path_entry = Entry(entry_frame, textvariable=self.log_path_var, width=60)
+        path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        Button(entry_frame, text="Browse...", command=self._browse_path).pack(side=tk.LEFT, padx=5)
+        
+        Label(path_frame, text="Default: " + DEFAULT_LOG_PATH, fg="gray", wraplength=550).pack(anchor="w")
+        
+        # Buttons
+        btn_frame = tk.Frame(self.window)
+        btn_frame.pack(fill=tk.X, padx=10, pady=20)
+        
+        Button(btn_frame, text="Save", command=self._save, bg="green", fg="white").pack(side=tk.RIGHT, padx=5)
+        Button(btn_frame, text="Cancel", command=self.window.destroy).pack(side=tk.RIGHT, padx=5)
+        Button(btn_frame, text="Reset to Default", command=self._reset_default).pack(side=tk.LEFT, padx=5)
+    
+    def _browse_path(self):
+        """Open file browser for log path."""
+        initial_dir = os.path.dirname(self.log_path_var.get())
+        if not os.path.exists(initial_dir):
+            initial_dir = os.path.expanduser("~")
+        
+        path = filedialog.askopenfilename(
+            parent=self.window,
+            title="Select Player.log",
+            initialdir=initial_dir,
+            filetypes=[("Log files", "*.log"), ("All files", "*.*")]
+        )
+        
+        if path:
+            self.log_path_var.set(path)
+    
+    def _reset_default(self):
+        """Reset to default path."""
+        self.log_path_var.set(DEFAULT_LOG_PATH)
+    
+    def _save(self):
+        """Save settings."""
+        self.settings.set('log_path', self.log_path_var.get())
+        self.on_save_callback()
+        messagebox.showinfo("Settings Saved", "Settings have been saved.", parent=self.window)
+        self.window.destroy()
 
 
 # ---------------------
@@ -972,10 +1729,11 @@ class VendorApp(tk.Tk):
     
     def __init__(self):
         super().__init__()
-        self.title("Vendor Reset Manager")
-        self.geometry("900x600")
+        self.title("Vendor Reset Manager (Auto-Scan)")
+        self.geometry("600x650")
         
-        # Initialize database
+        # Initialize settings and database
+        self.settings = SettingsManager(SETTINGS_FILE)
         self.db = VendorDatabase(DATABASE_PATH)
         
         # State
@@ -990,6 +1748,13 @@ class VendorApp(tk.Tk):
         self.flash_phase = False
         self.timer_running = True
         
+        # Auto-scan state
+        self.auto_scan_enabled = False
+        self.log_watcher: Optional[LogWatcher] = None
+        self.auto_scan_status_label = None
+        self.auto_scan_btn = None
+        self.last_update_time = None
+        
         # UI elements
         self.char_var = None
         self.char_menu = None
@@ -1002,12 +1767,14 @@ class VendorApp(tk.Tk):
         
         self._create_ui()
         self._start_animations()
+        self._init_auto_scan()
         
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
     
     def _create_ui(self):
         """Create the main UI."""
         self._create_top_bar()
+        self._create_search_bar()
         self._create_info_bar()
         self._create_button_bar()
         self._create_vendor_list()
@@ -1015,27 +1782,35 @@ class VendorApp(tk.Tk):
         self.update_vendor_list()
         self.update_total_values()
     
+    def _create_search_bar(self):
+        """Create search/filter bar on its own line."""
+        search_frame = tk.Frame(self)
+        search_frame.pack(fill=tk.X, padx=8, pady=4)
+        
+        Label(search_frame, text="Search:", font=("Arial", 10)).pack(side=tk.LEFT)
+        self.filter_var = StringVar()
+        self.filter_var.trace_add("write", lambda *a: self.update_vendor_list())
+        filter_entry = Entry(search_frame, textvariable=self.filter_var, font=("Arial", 11))
+        filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        # Multiple bindings to ensure filter updates reliably
+        filter_entry.bind("<KeyRelease>", lambda e: self.update_vendor_list())
+        filter_entry.bind("<Key>", lambda e: self.after(10, self.update_vendor_list))
+    
     def _create_top_bar(self):
-        """Create top bar with character selection and filters."""
+        """Create top bar with character selection."""
         top = tk.Frame(self)
         top.pack(fill=tk.X, padx=8, pady=6)
         
         Label(top, text="Character:").pack(side=tk.LEFT)
         self.char_var = StringVar(value=self.current_character)
-        self.char_var.trace("w", self._on_char_change)
+        self.char_var.trace_add("write", self._on_char_change)
         self.char_menu = OptionMenu(top, self.char_var, *self.characters)
         self.char_menu.pack(side=tk.LEFT, padx=6)
         
-        Button(top, text="Add New Character", command=self._add_new_character).pack(side=tk.LEFT, padx=6)
         Button(top, text="View Transactions", command=self._open_transactions_window).pack(side=tk.LEFT, padx=6)
         
-        Label(top, text="Filter:").pack(side=tk.LEFT, padx=(12,4))
-        self.filter_var = StringVar()
-        self.filter_var.trace("w", lambda *a: self.update_vendor_list())
-        Entry(top, textvariable=self.filter_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        
         self.show_muted_var = BooleanVar(value=False)
-        self.show_muted_var.trace("w", lambda *a: self.update_vendor_list())
+        self.show_muted_var.trace_add("write", lambda *a: self.update_vendor_list())
         Checkbutton(top, text="Show Muted", variable=self.show_muted_var).pack(side=tk.LEFT, padx=6)
     
     def _create_info_bar(self):
@@ -1056,7 +1831,285 @@ class VendorApp(tk.Tk):
         """Create button bar."""
         btns = tk.Frame(self)
         btns.pack(fill=tk.X, padx=8, pady=4)
+        
         Button(btns, text="Add New Vendor", command=self._open_add_vendor_window).pack(side=tk.LEFT, padx=4)
+        
+        # Auto-scan toggle button
+        self.auto_scan_btn = Button(btns, text="▶ Start Auto-Scan", command=self._toggle_auto_scan,
+                                    bg="#28a745", fg="white", font=("Arial", 10, "bold"))
+        self.auto_scan_btn.pack(side=tk.LEFT, padx=10)
+        
+        # Auto-scan status label
+        self.auto_scan_status_label = Label(btns, text="Auto-scan: OFF", fg="gray")
+        self.auto_scan_status_label.pack(side=tk.LEFT, padx=4)
+        
+        # Settings button
+        Button(btns, text="⚙ Settings", command=self._open_settings_window).pack(side=tk.RIGHT, padx=4)
+    
+    def _init_auto_scan(self):
+        """Initialize the auto-scan system."""
+        log_path = self.settings.get('log_path', DEFAULT_LOG_PATH)
+        self.log_watcher = LogWatcher(log_path, self._on_auto_scan_update)
+        
+        # Do an initial scan to populate the watcher's state
+        if os.path.exists(log_path):
+            self.log_watcher.check_for_updates()
+    
+    def _toggle_auto_scan(self):
+        """Toggle auto-scan on/off."""
+        self.auto_scan_enabled = not self.auto_scan_enabled
+        
+        if self.auto_scan_enabled:
+            # Check if log file exists
+            log_path = self.settings.get('log_path', DEFAULT_LOG_PATH)
+            if not os.path.exists(log_path):
+                messagebox.showwarning(
+                    "Log File Not Found",
+                    f"Cannot start auto-scan.\nPlayer.log not found at:\n{log_path}\n\nPlease check Settings.",
+                    parent=self
+                )
+                self.auto_scan_enabled = False
+                return
+            
+            # Reinitialize watcher with current path (starts from beginning)
+            self.log_watcher = LogWatcher(log_path, self._on_auto_scan_update)
+            
+            # Update UI to show scanning
+            self.auto_scan_btn.config(text="⏹ Stop Auto-Scan", bg="#dc3545")
+            self.auto_scan_status_label.config(text="Scanning...", fg="blue")
+            self.update()
+            
+            # Do initial full scan and import everything
+            self.log_watcher.check_for_updates()
+            self._import_all_from_watcher()
+            
+            self.auto_scan_status_label.config(text="Auto-scan: ACTIVE", fg="green")
+            self._auto_scan_tick()
+        else:
+            self.auto_scan_btn.config(text="▶ Start Auto-Scan", bg="#28a745")
+            self.auto_scan_status_label.config(text="Auto-scan: OFF", fg="gray")
+    
+    def _import_all_from_watcher(self):
+        """Import all data from the watcher (full import on start)."""
+        if not self.log_watcher:
+            return
+        
+        scan_result = self.log_watcher.get_scan_result()
+        
+        if not scan_result.characters_found:
+            return
+        
+        # Import all NPC mappings and zones
+        for npc_id, npc_name in scan_result.npc_mappings.items():
+            zone = scan_result.npc_zones.get(npc_id, 'Unknown')
+            self.db.save_npc_mapping(npc_id, npc_name, zone)
+        
+        # Import vendor data for all characters
+        for character in scan_result.characters_found:
+            if character not in self.characters:
+                self.characters.append(character)
+            
+            if character not in scan_result.vendor_data:
+                continue
+            
+            char_vendors = self.db.load_vendors(character)
+            existing_ids = {v.npc_id for v in char_vendors}
+            existing_names = {v.name: v for v in char_vendors}
+            
+            for npc_id, (council_left, reset_ts_ms, max_council) in scan_result.vendor_data[character].items():
+                npc_name = scan_result.npc_mappings.get(npc_id, f"Unknown_{npc_id}")
+                zone = scan_result.npc_zones.get(npc_id, 'Unknown')
+                
+                # Special handling for VendorFox - consolidate by name since he moves around
+                if npc_name == 'VendorFox' and 'VendorFox' in existing_names:
+                    vendor = existing_names['VendorFox']
+                    old_council = vendor.council_left
+                    
+                    if reset_ts_ms == 0:
+                        vendor.last_reset = datetime.now()
+                    else:
+                        reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
+                        vendor.last_reset = reset_time - timedelta(days=7)
+                    
+                    vendor.council_left = council_left
+                    vendor.npc_id = npc_id  # Update to latest NPC ID
+                    if max_council > vendor.reset_maximum:
+                        vendor.reset_maximum = max_council
+                    
+                    if old_council != council_left:
+                        self.db.log_transaction(
+                            character, npc_name, 'auto_scan',
+                            old_council, council_left,
+                            f"Auto-scan: {format_number(old_council)} → {format_number(council_left)}",
+                            npc_id
+                        )
+                elif npc_id in existing_ids:
+                    # Update existing vendor by npc_id
+                    for vendor in char_vendors:
+                        if vendor.npc_id == npc_id:
+                            old_council = vendor.council_left
+                            
+                            if reset_ts_ms == 0:
+                                vendor.last_reset = datetime.now()
+                            else:
+                                reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
+                                vendor.last_reset = reset_time - timedelta(days=7)
+                            
+                            vendor.council_left = council_left
+                            if max_council > vendor.reset_maximum:
+                                vendor.reset_maximum = max_council
+                            if zone and zone != 'Unknown':
+                                vendor.zone = zone
+                            
+                            if old_council != council_left:
+                                self.db.log_transaction(
+                                    character, npc_name, 'auto_scan',
+                                    old_council, council_left,
+                                    f"Auto-scan: {format_number(old_council)} → {format_number(council_left)}",
+                                    npc_id
+                                )
+                            break
+                else:
+                    # Create new vendor
+                    new_vendor = Vendor.from_scan_data(
+                        npc_id, npc_name, zone,
+                        council_left, reset_ts_ms, max_council
+                    )
+                    char_vendors.append(new_vendor)
+                    existing_names[npc_name] = new_vendor  # Track by name too
+                    
+                    self.db.log_transaction(
+                        character, npc_name, 'creation',
+                        0, council_left,
+                        f"Auto-scan import: {format_number(council_left)} council",
+                        npc_id
+                    )
+            
+            self.db.save_vendors(char_vendors, character)
+        
+        # Update character menu and refresh UI
+        self.characters.sort()
+        self._update_char_menu()
+        self.vendors = self.db.load_vendors(self.current_character)
+        self.update_vendor_list()
+        self.update_total_values()
+    
+    def _auto_scan_tick(self):
+        """Periodic check for new log data."""
+        if not self.auto_scan_enabled or not self.timer_running:
+            return
+        
+        try:
+            if self.log_watcher and self.log_watcher.check_for_updates():
+                self._apply_watcher_updates()
+        except Exception as e:
+            print(f"Auto-scan error: {e}")
+        
+        # Schedule next tick
+        self.after(AUTO_SCAN_INTERVAL_MS, self._auto_scan_tick)
+    
+    def _apply_watcher_updates(self):
+        """Apply updates from the log watcher to the database and UI."""
+        if not self.log_watcher:
+            return
+        
+        updates = self.log_watcher.last_scan_updates
+        if not updates:
+            return
+        
+        # Get current data from watcher
+        scan_result = self.log_watcher.get_scan_result()
+        
+        # Track which characters were updated
+        updated_characters = set()
+        
+        for character, npc_id, npc_name in updates:
+            updated_characters.add(character)
+            
+            # Ensure character exists in our list
+            if character not in self.characters:
+                self.characters.append(character)
+                self.characters.sort()
+                self._update_char_menu()
+            
+            # Save NPC mapping and zone
+            zone = scan_result.npc_zones.get(npc_id, 'Unknown')
+            self.db.save_npc_mapping(npc_id, npc_name, zone)
+            
+            # Get vendor data
+            if character in scan_result.vendor_data and npc_id in scan_result.vendor_data[character]:
+                council_left, reset_ts_ms, max_council = scan_result.vendor_data[character][npc_id]
+                
+                # Load vendors for this character
+                char_vendors = self.db.load_vendors(character)
+                
+                # Special handling for VendorFox - find by name since he moves around
+                if npc_name == 'VendorFox':
+                    existing = next((v for v in char_vendors if v.name == 'VendorFox'), None)
+                else:
+                    existing = next((v for v in char_vendors if v.npc_id == npc_id), None)
+                
+                if existing:
+                    # Update existing vendor
+                    old_council = existing.council_left
+                    
+                    if reset_ts_ms == 0:
+                        existing.last_reset = datetime.now()
+                    else:
+                        reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
+                        existing.last_reset = reset_time - timedelta(days=7)
+                    
+                    existing.council_left = council_left
+                    existing.npc_id = npc_id  # Update to latest NPC ID
+                    if max_council > existing.reset_maximum:
+                        existing.reset_maximum = max_council
+                    if zone and zone != 'Unknown' and npc_name != 'VendorFox':
+                        existing.zone = zone
+                    
+                    # Log transaction if council changed
+                    if old_council != council_left:
+                        self.db.log_transaction(
+                            character, npc_name, 'auto_scan',
+                            old_council, council_left,
+                            f"Auto-scan: {format_number(old_council)} → {format_number(council_left)}",
+                            npc_id
+                        )
+                else:
+                    # Create new vendor
+                    new_vendor = Vendor.from_scan_data(
+                        npc_id, npc_name, zone,
+                        council_left, reset_ts_ms, max_council
+                    )
+                    char_vendors.append(new_vendor)
+                    
+                    self.db.log_transaction(
+                        character, npc_name, 'creation',
+                        0, council_left,
+                        f"Auto-scan import: {format_number(council_left)} council",
+                        npc_id
+                    )
+                
+                # Save vendors for this character
+                self.db.save_vendors(char_vendors, character)
+        
+        # Update UI if current character was affected
+        if self.current_character in updated_characters:
+            self.vendors = self.db.load_vendors(self.current_character)
+            self.update_vendor_list()
+            self.update_total_values()
+        
+        # Update status with last update time
+        self.last_update_time = datetime.now()
+        update_names = [name for _, _, name in updates]
+        status_text = f"Auto-scan: Updated {', '.join(update_names[:3])}"
+        if len(update_names) > 3:
+            status_text += f" +{len(update_names)-3} more"
+        status_text += f" ({self.last_update_time.strftime('%H:%M:%S')})"
+        self.auto_scan_status_label.config(text=status_text, fg="green")
+    
+    def _on_auto_scan_update(self, character: str, npc_id: int, npc_name: str):
+        """Callback when auto-scan finds new data (not currently used, updates batched)."""
+        pass
     
     def _create_vendor_list(self):
         """Create scrollable vendor list."""
@@ -1098,11 +2151,6 @@ class VendorApp(tk.Tk):
         self.characters.sort()
         self.char_var.set(safe_name)
         self._update_char_menu()
-        
-        # Copy default vendors
-        default_vendors = self.db.load_vendors(DEFAULT_CHARACTER)
-        if default_vendors:
-            self.db.save_vendors(default_vendors, safe_name)
     
     def _update_char_menu(self):
         """Update character menu."""
@@ -1118,6 +2166,130 @@ class VendorApp(tk.Tk):
         """Open transaction history window."""
         TransactionWindow(self, self.db, self.current_character)
     
+    def _open_settings_window(self):
+        """Open settings window."""
+        SettingsWindow(self, self.settings, lambda: None)
+    
+    def _scan_player_log(self):
+        """Scan Player.log file for vendor data."""
+        log_path = self.settings.get('log_path', DEFAULT_LOG_PATH)
+        
+        if not os.path.exists(log_path):
+            response = messagebox.askyesno(
+                "Log File Not Found",
+                f"Player.log not found at:\n{log_path}\n\nWould you like to browse for it?",
+                parent=self
+            )
+            if response:
+                path = filedialog.askopenfilename(
+                    parent=self,
+                    title="Select Player.log",
+                    filetypes=[("Log files", "*.log"), ("All files", "*.*")]
+                )
+                if path:
+                    self.settings.set('log_path', path)
+                    log_path = path
+                else:
+                    return
+            else:
+                return
+        
+        # Show scanning message
+        self.config(cursor="wait")
+        self.update()
+        
+        try:
+            scanner = PlayerLogScanner(log_path)
+            result = scanner.scan()
+            
+            self.config(cursor="")
+            
+            if not result.characters_found and not result.vendor_data:
+                messagebox.showinfo(
+                    "Scan Complete",
+                    "No vendor data found in the log file.\n\nMake sure you've interacted with vendors in-game.",
+                    parent=self
+                )
+                return
+            
+            # Show results window
+            ScanResultsWindow(
+                self, result, self.db, self.current_character,
+                self._on_scan_import
+            )
+        
+        except Exception as e:
+            self.config(cursor="")
+            self._show_error(f"Error scanning log file: {e}")
+    
+    def _on_scan_import(self, character: str, npc_ids: List[int], scan_result: ScanResult):
+        """Handle import from scan results."""
+        # Build vendor list for character
+        vendors = self.db.load_vendors(character)
+        existing_ids = {v.npc_id for v in vendors}
+        
+        for npc_id in npc_ids:
+            if npc_id not in scan_result.vendor_data.get(character, {}):
+                continue
+            
+            council_left, reset_ts_ms, max_council = scan_result.vendor_data[character][npc_id]
+            npc_name = scan_result.npc_mappings.get(npc_id, f"Unknown_{npc_id}")
+            zone = scan_result.npc_zones.get(npc_id, self.db.get_npc_zone(npc_id))
+            if not zone or zone == 'Unknown':
+                zone = 'Unknown'
+            
+            if npc_id in existing_ids:
+                # Update existing
+                for vendor in vendors:
+                    if vendor.npc_id == npc_id:
+                        old_council = vendor.council_left
+                        
+                        if reset_ts_ms == 0:
+                            vendor.last_reset = datetime.now()
+                        else:
+                            reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
+                            vendor.last_reset = reset_time - timedelta(days=7)
+                        
+                        vendor.council_left = council_left
+                        if max_council > vendor.reset_maximum:
+                            vendor.reset_maximum = max_council
+                        
+                        # Update zone if we have better data
+                        if zone and zone != 'Unknown':
+                            vendor.zone = zone
+                        break
+            else:
+                # Create new vendor
+                new_vendor = Vendor.from_scan_data(
+                    npc_id, npc_name, zone,
+                    council_left, reset_ts_ms, max_council
+                )
+                vendors.append(new_vendor)
+                
+                self.db.log_transaction(
+                    character, npc_name, 'creation',
+                    0, council_left,
+                    f"Auto-scan import: {format_number(council_left)} council",
+                    npc_id
+                )
+        
+        # Save and refresh
+        self.db.save_vendors(vendors, character)
+        
+        # Update character list if new
+        if character not in self.characters:
+            self.characters.append(character)
+            self.characters.sort()
+            self._update_char_menu()
+        
+        # Switch to imported character
+        if character != self.current_character:
+            self.char_var.set(character)
+        else:
+            self.vendors = vendors
+            self.update_vendor_list()
+            self.update_total_values()
+    
     def _open_add_vendor_window(self):
         """Open window to add a new vendor."""
         add_window = Toplevel(self)
@@ -1128,7 +2300,6 @@ class VendorApp(tk.Tk):
         form_frame = form.create_form()
         form_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Buttons
         button_line = tk.Frame(add_window)
         button_line.pack(padx=10, pady=10, fill=tk.X)
         
@@ -1143,9 +2314,14 @@ class VendorApp(tk.Tk):
                 last_reset = time_obj.calculate_last_reset(values['override_max_time'])
                 
                 new_vendor = Vendor(
-                    values['name'], values['zone'], values['council'],
-                    last_reset, values['council'], values['categories'], 
-                    values['muted']
+                    name=values['name'],
+                    zone=values['zone'],
+                    council_left=values['council'],
+                    last_reset=last_reset,
+                    reset_maximum=values['council'],
+                    categories=values['categories'],
+                    muted=values['muted'],
+                    npc_id=0
                 )
                 
                 self.db.log_transaction(
@@ -1173,13 +2349,30 @@ class VendorApp(tk.Tk):
         """Open window to update a vendor."""
         update_window = Toplevel(self)
         update_window.title(f"Update {vendor.name}")
-        update_window.geometry("640x400")
+        update_window.geometry("640x450")
         
         form = VendorForm(update_window, vendor)
         form_frame = form.create_form()
         form_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Buttons
+        # Zone update field for scanned vendors
+        if vendor.npc_id:
+            zone_frame = tk.Frame(update_window)
+            zone_frame.pack(padx=10, fill=tk.X)
+            Label(zone_frame, text="Update Zone:").pack(side=tk.LEFT)
+            zone_entry = Entry(zone_frame, width=30)
+            zone_entry.insert(0, vendor.zone)
+            zone_entry.pack(side=tk.LEFT, padx=5)
+            
+            def save_zone():
+                new_zone = zone_entry.get().strip()
+                if new_zone:
+                    vendor.zone = new_zone
+                    self.db.update_npc_zone(vendor.npc_id, new_zone)
+                    messagebox.showinfo("Zone Updated", f"Zone updated to: {new_zone}", parent=update_window)
+            
+            Button(zone_frame, text="Save Zone", command=save_zone).pack(side=tk.LEFT, padx=5)
+        
         button_line = tk.Frame(update_window)
         button_line.pack(padx=10, pady=10, fill=tk.X)
         
@@ -1193,7 +2386,8 @@ class VendorApp(tk.Tk):
                 self.db.log_transaction(
                     self.current_character, vendor.name, 'reset',
                     old_council, vendor.council_left,
-                    f"Manual reset from {format_number(old_council)} to {format_number(vendor.council_left)}"
+                    f"Manual reset from {format_number(old_council)} to {format_number(vendor.council_left)}",
+                    vendor.npc_id
                 )
                 
                 self.db.save_vendors(self.vendors, self.current_character)
@@ -1224,7 +2418,8 @@ class VendorApp(tk.Tk):
                     self.db.log_transaction(
                         self.current_character, vendor.name, transaction_type,
                         old_council, values['council'],
-                        f"Manual update: {format_number(old_council)} → {format_number(values['council'])}"
+                        f"Manual update: {format_number(old_council)} → {format_number(values['council'])}",
+                        vendor.npc_id
                     )
                 
                 self.db.save_vendors(self.vendors, self.current_character)
@@ -1247,10 +2442,11 @@ class VendorApp(tk.Tk):
             self.db.log_transaction(
                 self.current_character, vendor.name, 'deletion',
                 vendor.council_left, 0,
-                f"Vendor deleted with {vendor.council_left} council remaining"
+                f"Vendor deleted with {vendor.council_left} council remaining",
+                vendor.npc_id
             )
             
-            self.vendors = [v for v in self.vendors if v.name != vendor.name]
+            self.vendors = [v for v in self.vendors if v.name != vendor.name or v.npc_id != vendor.npc_id]
             self.db.save_vendors(self.vendors, self.current_character)
             self.update_vendor_list()
             self.update_total_values()
@@ -1267,21 +2463,26 @@ class VendorApp(tk.Tk):
     
     def update_vendor_list(self):
         """Update the vendor list display."""
-        # Clear existing
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
         self.pulse_widgets.clear()
         
-        # Filter vendors
-        filter_text = self.filter_var.get() # No need for .lower() here, handled in matches_filter
-        show_muted = self.show_muted_var.get()
+        # Safety check - filter_var might not be initialized yet
+        if self.filter_var is None:
+            filter_text = ""
+        else:
+            filter_text = self.filter_var.get()
+        
+        if self.show_muted_var is None:
+            show_muted = False
+        else:
+            show_muted = self.show_muted_var.get()
         
         displayed_vendors = [
             v for v in self.vendors
             if (show_muted or not v.muted) and v.matches_filter(filter_text)
         ]
         
-        # Calculate time range for color scaling
         not_ready = [v for v in displayed_vendors if not v.is_ready_to_reset]
         if not_ready:
             times = [(v.next_reset - datetime.now()).total_seconds() for v in not_ready]
@@ -1290,10 +2491,8 @@ class VendorApp(tk.Tk):
         else:
             max_time = min_time = 0
         
-        # Sort by reset time
         displayed_vendors.sort(key=lambda v: v.next_reset)
         
-        # Create cards
         callbacks = {
             'update': self._open_update_vendor_window,
             'delete': self._delete_vendor,
@@ -1303,7 +2502,6 @@ class VendorApp(tk.Tk):
         for vendor in displayed_vendors:
             card = VendorCard(self.scrollable_frame, vendor, min_time, max_time, callbacks)
             
-            # Track for pulse animation
             if card.widgets_for_pulse:
                 for widget in card.widgets_for_pulse:
                     self.pulse_widgets.append({
@@ -1389,6 +2587,7 @@ class VendorApp(tk.Tk):
         """Handle window close."""
         try:
             self.timer_running = False
+            self.auto_scan_enabled = False
             self.db.save_vendors(self.vendors, self.current_character)
         except Exception as e:
             print(f"Error saving on close: {e}")
