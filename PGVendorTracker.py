@@ -23,6 +23,9 @@ MAX_HOURS = 23
 MAX_MINUTES = 59
 MAX_TOTAL_MINUTES = MAX_DAYS * 24 * 60 + MAX_HOURS * 60 + MAX_MINUTES
 
+# Invalid council maximum threshold (2^31 - 1, likely overflow/invalid value)
+INVALID_MAX_COUNCIL = 2147483647
+
 # Default Player.log path (Windows)
 DEFAULT_LOG_PATH = os.path.expandvars(r'C:\Users\%USERNAME%\AppData\LocalLow\Elder Game\Project Gorgon\Player.log')
 SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
@@ -259,6 +262,11 @@ class LogWatcher:
             reset_ts_ms = int(vendor_match.group(4))
             max_council = int(vendor_match.group(5))
             
+            # Check for invalid max_council value and replace both with 0
+            if max_council >= INVALID_MAX_COUNCIL:
+                max_council = 0
+                council_left = 0
+            
             self.vendor_data[self.current_character][npc_id] = (council_left, reset_ts_ms, max_council)
             self.current_vendor_npc_id = npc_id
             
@@ -272,6 +280,11 @@ class LogWatcher:
             council_left = int(update_match.group(1))
             reset_ts_ms = int(update_match.group(2))
             max_council = int(update_match.group(3))
+            
+            # Check for invalid max_council value and replace both with 0
+            if max_council >= INVALID_MAX_COUNCIL:
+                max_council = 0
+                council_left = 0
             
             self.vendor_data[self.current_character][self.current_vendor_npc_id] = (council_left, reset_ts_ms, max_council)
             
@@ -374,6 +387,11 @@ class PlayerLogScanner:
                             reset_ts_ms = int(vendor_match.group(4))
                             max_council = int(vendor_match.group(5))
                             
+                            # Check for invalid max_council value and replace both with 0
+                            if max_council >= INVALID_MAX_COUNCIL:
+                                max_council = 0
+                                council_left = 0
+                            
                             # Store vendor data for current character
                             vendor_data[current_character][npc_id] = (council_left, reset_ts_ms, max_council)
                             
@@ -387,6 +405,11 @@ class PlayerLogScanner:
                             council_left = int(update_match.group(1))
                             reset_ts_ms = int(update_match.group(2))
                             max_council = int(update_match.group(3))
+                            
+                            # Check for invalid max_council value and replace both with 0
+                            if max_council >= INVALID_MAX_COUNCIL:
+                                max_council = 0
+                                council_left = 0
                             
                             # Update the currently open vendor's data
                             vendor_data[current_character][current_vendor_npc_id] = (council_left, reset_ts_ms, max_council)
@@ -437,7 +460,9 @@ class VendorDatabase:
                     )
                 ''')
                 
-                # Vendors table (per character)
+                # Vendors table (per character) - identified by name+zone, not npc_id
+                # npc_id is stored for reference but not as unique key since the game
+                # assigns different IDs to the same NPC in different sessions
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS vendors (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -450,7 +475,7 @@ class VendorDatabase:
                         reset_maximum INTEGER NOT NULL,
                         categories TEXT NOT NULL,
                         muted BOOLEAN NOT NULL,
-                        UNIQUE(character_name, npc_id)
+                        UNIQUE(character_name, npc_name, zone)
                     )
                 ''')
                 
@@ -480,9 +505,76 @@ class VendorDatabase:
                     ON vendors(character_name)
                 ''')
                 
+                # Check if we need to migrate from old schema (npc_id unique) to new (name+zone unique)
+                self._migrate_to_name_zone_unique(conn)
+                
                 conn.commit()
         except sqlite3.Error as e:
             raise RuntimeError(f"Could not initialize database: {e}")
+    
+    def _migrate_to_name_zone_unique(self, conn):
+        """
+        Migrate from old schema (UNIQUE on npc_id) to new schema (UNIQUE on name+zone).
+        This consolidates duplicate vendors that have the same name and zone but different npc_ids.
+        """
+        cursor = conn.cursor()
+        
+        # Check if migration is needed by looking for duplicates
+        cursor.execute('''
+            SELECT character_name, npc_name, zone, COUNT(*) as cnt
+            FROM vendors
+            GROUP BY character_name, npc_name, zone
+            HAVING cnt > 1
+        ''')
+        duplicates = cursor.fetchall()
+        
+        if not duplicates:
+            return  # No migration needed
+        
+        print(f"Migrating database: consolidating {len(duplicates)} duplicate vendor groups...")
+        
+        for char_name, npc_name, zone, count in duplicates:
+            # Get all duplicate entries for this vendor
+            cursor.execute('''
+                SELECT id, npc_id, council_left, last_reset, reset_maximum, categories, muted
+                FROM vendors
+                WHERE character_name = ? AND npc_name = ? AND zone = ?
+                ORDER BY last_reset DESC
+            ''', (char_name, npc_name, zone))
+            rows = cursor.fetchall()
+            
+            if len(rows) <= 1:
+                continue
+            
+            # Keep the entry with the most recent last_reset, but use highest reset_maximum
+            # and most recent council_left
+            keep_id = rows[0][0]
+            keep_npc_id = rows[0][1]
+            best_council_left = rows[0][2]
+            best_last_reset = rows[0][3]
+            best_reset_maximum = max(row[4] for row in rows)
+            keep_categories = rows[0][5]
+            keep_muted = rows[0][6]
+            
+            # Find most recent npc_id (highest is usually most recent)
+            best_npc_id = max(row[1] for row in rows)
+            
+            # Update the kept row with best values
+            cursor.execute('''
+                UPDATE vendors
+                SET npc_id = ?, council_left = ?, reset_maximum = ?
+                WHERE id = ?
+            ''', (best_npc_id, best_council_left, best_reset_maximum, keep_id))
+            
+            # Delete the duplicate rows
+            ids_to_delete = [row[0] for row in rows if row[0] != keep_id]
+            for del_id in ids_to_delete:
+                cursor.execute('DELETE FROM vendors WHERE id = ?', (del_id,))
+            
+            print(f"  Consolidated {count} entries for {npc_name} ({zone}) -> kept npc_id {best_npc_id}")
+        
+        conn.commit()
+        print("Migration complete.")
     
     def save_npc_mapping(self, npc_id: int, npc_name: str, zone: str = ''):
         """Save or update NPC ID to name mapping."""
@@ -573,8 +665,6 @@ class VendorDatabase:
                 rows = cursor.fetchall()
                 
                 vendors = []
-                vendor_fox_entry = None
-                
                 for row in rows:
                     try:
                         vendor = Vendor(
@@ -587,30 +677,16 @@ class VendorDatabase:
                             categories=json.loads(row[6]),
                             muted=row[7]
                         )
-                        
-                        # Consolidate VendorFox - keep the one with latest reset time
-                        if vendor.name == 'VendorFox':
-                            if vendor_fox_entry is None:
-                                vendor_fox_entry = vendor
-                            else:
-                                # Keep the one with more recent last_reset
-                                if vendor.last_reset > vendor_fox_entry.last_reset:
-                                    vendor_fox_entry = vendor
-                        else:
-                            vendors.append(vendor)
+                        vendors.append(vendor)
                     except (ValueError, json.JSONDecodeError) as e:
                         print(f"Error loading vendor {row[1]}: {e}")
-                
-                # Add consolidated VendorFox if found
-                if vendor_fox_entry is not None:
-                    vendors.append(vendor_fox_entry)
                 
                 return vendors
         except sqlite3.Error as e:
             raise RuntimeError(f"Could not load vendors for {character_name}: {e}")
     
     def get_vendor_by_npc_id(self, character_name: str, npc_id: int) -> Optional['Vendor']:
-        """Get a specific vendor by NPC ID."""
+        """Get a specific vendor by NPC ID (legacy method, prefer get_vendor_by_name_zone)."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -635,6 +711,34 @@ class VendorDatabase:
                 return None
         except sqlite3.Error as e:
             print(f"Error getting vendor: {e}")
+            return None
+    
+    def get_vendor_by_name_zone(self, character_name: str, npc_name: str, zone: str) -> Optional['Vendor']:
+        """Get a specific vendor by name and zone (the canonical lookup method)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT npc_id, npc_name, zone, council_left, last_reset, 
+                           reset_maximum, categories, muted 
+                    FROM vendors WHERE character_name = ? AND npc_name = ? AND zone = ?
+                ''', (character_name, npc_name, zone))
+                row = cursor.fetchone()
+                
+                if row:
+                    return Vendor(
+                        npc_id=row[0],
+                        name=row[1],
+                        zone=row[2],
+                        council_left=row[3],
+                        last_reset=row[4],
+                        reset_maximum=row[5],
+                        categories=json.loads(row[6]),
+                        muted=row[7]
+                    )
+                return None
+        except sqlite3.Error as e:
+            print(f"Error getting vendor by name/zone: {e}")
             return None
     
     def get_all_characters(self) -> List[str]:
@@ -678,85 +782,103 @@ class VendorDatabase:
     def get_council_earned(self, character_name: str, 
                            vendor_name: Optional[str] = None, 
                            days: int = 7) -> int:
-        """Get total council earned in the last N days."""
+        """
+        Get total council earned in the last N days by summing negative 
+        council_change values from transactions (negative = you sold to vendor = earned).
+        This matches the logic used in the Daily Earnings tab of Transaction History.
+        """
         try:
             cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 
                 if vendor_name:
-                    return self._get_vendor_earned(cursor, character_name, vendor_name, cutoff_date)
+                    cursor.execute('''
+                        SELECT COALESCE(SUM(ABS(council_change)), 0) FROM transactions
+                        WHERE character_name = ? AND vendor_name = ?
+                        AND timestamp >= ?
+                        AND council_change < 0
+                        AND transaction_type != 'deletion'
+                    ''', (character_name, vendor_name, cutoff_date))
                 else:
-                    return self._get_all_vendors_earned(cursor, character_name, cutoff_date)
+                    cursor.execute('''
+                        SELECT COALESCE(SUM(ABS(council_change)), 0) FROM transactions
+                        WHERE character_name = ?
+                        AND timestamp >= ?
+                        AND council_change < 0
+                        AND transaction_type != 'deletion'
+                    ''', (character_name, cutoff_date))
+                
+                return cursor.fetchone()[0]
         except sqlite3.Error as e:
             print(f"Error getting council earned: {e}")
             return 0
     
-    def _get_vendor_earned(self, cursor, character_name: str, 
-                           vendor_name: str, cutoff_date: str) -> int:
-        """Calculate earned for a specific vendor."""
-        cursor.execute('''
-            SELECT SUM(ABS(council_change)) FROM transactions
-            WHERE character_name = ? AND vendor_name = ?
-            AND timestamp >= ? AND transaction_type IN ('purchase', 'adjustment', 'scan_update')
-            AND council_change < 0
-        ''', (character_name, vendor_name, cutoff_date))
-        result = cursor.fetchone()
-        spent = result[0] if result[0] is not None else 0
+                                                              
+                                                                      
+                                                     
+                          
+                                                             
+                                                        
+                                                                                                
+                                  
+                                                        
+                                  
+                                                         
         
-        cursor.execute('''
-            SELECT council_left, reset_maximum FROM vendors
-            WHERE character_name = ? AND npc_name = ?
-        ''', (character_name, vendor_name))
-        vendor_row = cursor.fetchone()
+                          
+                                                           
+                                                     
+                                           
+                                      
         
-        if vendor_row:
-            council_left, reset_maximum = vendor_row
-            current_spent = reset_maximum - council_left
+                      
+                                                    
+                                                        
             
-            cursor.execute('''
-                SELECT COUNT(*) FROM transactions
-                WHERE character_name = ? AND vendor_name = ?
-                AND timestamp >= ?
-            ''', (character_name, vendor_name, cutoff_date))
+                              
+                                                 
+                                                            
+                                  
+                                                            
             
-            if cursor.fetchone()[0] == 0:
-                spent += current_spent
+                                         
+                                      
         
-        return spent
+                    
     
-    def _get_all_vendors_earned(self, cursor, character_name: str, cutoff_date: str) -> int:
-        """Calculate earned for all vendors."""
-        total_earned = 0
-        cursor.execute('''
-            SELECT npc_name, council_left, reset_maximum FROM vendors
-            WHERE character_name = ?
-        ''', (character_name,))
-        vendors = cursor.fetchall()
+                                                                                            
+                                               
+                        
+                          
+                                                                     
+                                    
+                               
+                                   
         
-        for vendor_name, council_left, reset_maximum in vendors:
-            cursor.execute('''
-                SELECT SUM(ABS(council_change)) FROM transactions
-                WHERE character_name = ? AND vendor_name = ?
-                AND timestamp >= ? AND transaction_type IN ('purchase', 'adjustment', 'scan_update')
-                AND council_change < 0
-            ''', (character_name, vendor_name, cutoff_date))
-            result = cursor.fetchone()
-            spent = result[0] if result[0] is not None else 0
+                                                                
+                              
+                                                                 
+                                                            
+                                                                                                    
+                                      
+                                                            
+                                      
+                                                             
             
-            current_spent = reset_maximum - council_left
-            cursor.execute('''
-                SELECT COUNT(*) FROM transactions
-                WHERE character_name = ? AND vendor_name = ?
-                AND timestamp >= ?
-            ''', (character_name, vendor_name, cutoff_date))
+                                                        
+                              
+                                                 
+                                                            
+                                  
+                                                            
             
-            if cursor.fetchone()[0] == 0:
-                spent += current_spent
+                                         
+                                      
             
-            total_earned += spent
+                                 
         
-        return total_earned
+                           
     
     def get_transactions(self, character_name: str, 
                          vendor_name: Optional[str] = None,
@@ -849,6 +971,12 @@ class Vendor:
         self.npc_id = npc_id
         self.name = name
         self.zone = zone
+        
+        # Handle invalid maximum values - if reset_maximum is invalid, set both to 0
+        if reset_maximum >= INVALID_MAX_COUNCIL:
+            reset_maximum = 0
+            council_left = 0
+        
         self.council_left = int(council_left)
         self.last_reset = self._parse_last_reset(last_reset, name)
         self.reset_maximum = int(reset_maximum)
@@ -877,6 +1005,11 @@ class Vendor:
     def from_scan_data(cls, npc_id: int, npc_name: str, zone: str,
                        council_left: int, reset_ts_ms: int, max_council: int) -> 'Vendor':
         """Create a Vendor from scanned log data."""
+        # Check for invalid max_council and replace both values with 0
+        if max_council >= INVALID_MAX_COUNCIL:
+            max_council = 0
+            council_left = 0
+        
         if reset_ts_ms == 0:
             # Vendor at full, assume just reset (or within 7 days)
             last_reset = datetime.now()
@@ -908,8 +1041,8 @@ class Vendor:
     
     @property
     def is_empty(self) -> bool:
-        """Check if vendor has no council left."""
-        return self.council_left == 0
+        """Check if vendor has no council left (under 1k treated as empty)."""
+        return self.council_left < 1000
     
     @property
     def time_until_reset(self) -> TimeUntilReset:
@@ -1374,8 +1507,9 @@ class TransactionWindow:
         for trans in transactions:
             # Updated to handle npc_id column
             trans_id, char, vendor, npc_id, trans_type, before, after, change, timestamp, notes = trans
-            if change > 0:
-                total_earned += change
+            # Count negative changes as earned (sold to vendor), but exclude deletions
+            if change < 0 and trans_type != 'deletion':
+                total_earned += abs(change)
             
             color = "green" if change > 0 else "red" if change < 0 else "black"
             dt = datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M")
@@ -1400,7 +1534,8 @@ class TransactionWindow:
         daily_earnings = defaultdict(int)
         for trans in transactions:
             trans_id, char, vendor, npc_id, trans_type, before, after, change, timestamp, notes = trans
-            if change < 0:
+            # Exclude deletions from daily earnings
+            if change < 0 and trans_type != 'deletion':
                 dt = datetime.fromisoformat(timestamp)
                 date_key = dt.date()
                 daily_earnings[date_key] += abs(change)
@@ -1913,16 +2048,23 @@ class VendorApp(tk.Tk):
                 continue
             
             char_vendors = self.db.load_vendors(character)
-            existing_ids = {v.npc_id for v in char_vendors}
-            existing_names = {v.name: v for v in char_vendors}
+            # Create lookup by name+zone (the canonical identifier)
+            existing_by_name_zone = {(v.name, v.zone): v for v in char_vendors}
             
             for npc_id, (council_left, reset_ts_ms, max_council) in scan_result.vendor_data[character].items():
                 npc_name = scan_result.npc_mappings.get(npc_id, f"Unknown_{npc_id}")
                 zone = scan_result.npc_zones.get(npc_id, 'Unknown')
                 
-                # Special handling for VendorFox - consolidate by name since he moves around
-                if npc_name == 'VendorFox' and 'VendorFox' in existing_names:
-                    vendor = existing_names['VendorFox']
+                # VendorFox is special - always use 'Anywhere' as zone
+                if npc_name == 'VendorFox':
+                    zone = 'Anywhere'
+                
+                # Look up by name+zone (canonical identifier)
+                key = (npc_name, zone)
+                
+                if key in existing_by_name_zone:
+                    # Update existing vendor
+                    vendor = existing_by_name_zone[key]
                     old_council = vendor.council_left
                     
                     if reset_ts_ms == 0:
@@ -1943,32 +2085,6 @@ class VendorApp(tk.Tk):
                             f"Auto-scan: {format_number(old_council)} → {format_number(council_left)}",
                             npc_id
                         )
-                elif npc_id in existing_ids:
-                    # Update existing vendor by npc_id
-                    for vendor in char_vendors:
-                        if vendor.npc_id == npc_id:
-                            old_council = vendor.council_left
-                            
-                            if reset_ts_ms == 0:
-                                vendor.last_reset = datetime.now()
-                            else:
-                                reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
-                                vendor.last_reset = reset_time - timedelta(days=7)
-                            
-                            vendor.council_left = council_left
-                            if max_council > vendor.reset_maximum:
-                                vendor.reset_maximum = max_council
-                            if zone and zone != 'Unknown':
-                                vendor.zone = zone
-                            
-                            if old_council != council_left:
-                                self.db.log_transaction(
-                                    character, npc_name, 'auto_scan',
-                                    old_council, council_left,
-                                    f"Auto-scan: {format_number(old_council)} → {format_number(council_left)}",
-                                    npc_id
-                                )
-                            break
                 else:
                     # Create new vendor
                     new_vendor = Vendor.from_scan_data(
@@ -1976,7 +2092,7 @@ class VendorApp(tk.Tk):
                         council_left, reset_ts_ms, max_council
                     )
                     char_vendors.append(new_vendor)
-                    existing_names[npc_name] = new_vendor  # Track by name too
+                    existing_by_name_zone[key] = new_vendor  # Track by name+zone
                     
                     self.db.log_transaction(
                         character, npc_name, 'creation',
@@ -2043,11 +2159,12 @@ class VendorApp(tk.Tk):
                 # Load vendors for this character
                 char_vendors = self.db.load_vendors(character)
                 
-                # Special handling for VendorFox - find by name since he moves around
+                # VendorFox is special - always use 'Anywhere' as zone
                 if npc_name == 'VendorFox':
-                    existing = next((v for v in char_vendors if v.name == 'VendorFox'), None)
-                else:
-                    existing = next((v for v in char_vendors if v.npc_id == npc_id), None)
+                    zone = 'Anywhere'
+                
+                # Look up by name+zone (canonical identifier)
+                existing = next((v for v in char_vendors if v.name == npc_name and v.zone == zone), None)
                 
                 if existing:
                     # Update existing vendor
@@ -2063,8 +2180,7 @@ class VendorApp(tk.Tk):
                     existing.npc_id = npc_id  # Update to latest NPC ID
                     if max_council > existing.reset_maximum:
                         existing.reset_maximum = max_council
-                    if zone and zone != 'Unknown' and npc_name != 'VendorFox':
-                        existing.zone = zone
+                    # Note: zone is part of the vendor's identity now, don't update it
                     
                     # Log transaction if council changed
                     if old_council != council_left:
@@ -2446,7 +2562,8 @@ class VendorApp(tk.Tk):
                 vendor.npc_id
             )
             
-            self.vendors = [v for v in self.vendors if v.name != vendor.name or v.npc_id != vendor.npc_id]
+            # Delete by name+zone (the canonical identifier)
+            self.vendors = [v for v in self.vendors if not (v.name == vendor.name and v.zone == vendor.zone)]
             self.db.save_vendors(self.vendors, self.current_character)
             self.update_vendor_list()
             self.update_total_values()
