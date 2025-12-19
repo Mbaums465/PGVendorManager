@@ -37,7 +37,7 @@ INSTALLATION & USAGE (FOR WINDOWS)
 
 Getting started is easy! The included "VendorMe.bat" file handles everything for you.
 
-1. Download the Files: Place "VendorMe.bat" and "PGVendorTracker.py" in the same folder.
+1. Download the Files: Place "VendorMe.bat", "playerlog_reader.py" and "PGVendorTracker.py" in the same folder.
 
 2. Run the Launcher: Double-click "VendorMe.bat".
 
@@ -90,3 +90,4 @@ FILTERING AND VIEWING
 
 TRANSACTIONS
 * Click "View Transactions" to open the history window. Here you can see a detailed log of all changes and a summary of your council earnings by day.
+
