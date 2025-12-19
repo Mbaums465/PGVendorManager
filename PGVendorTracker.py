@@ -1,2724 +1,1311 @@
+#!/usr/bin/env python3
+"""AnatomyDPS - Project Gorgon Damage Parser with real-time log monitoring."""
+
+import os, re, threading, time, json, queue
 import tkinter as tk
-from tkinter import messagebox, Toplevel, Label, Entry, Button, Scrollbar, Canvas, OptionMenu, StringVar, simpledialog, Checkbutton, BooleanVar, filedialog
-from tkinter import ttk
-import sqlite3
-import json
-import re
+from tkinter import ttk, filedialog, messagebox, simpledialog
 from datetime import datetime, timedelta
-from collections import defaultdict
-import os
-import sys
-import time
-from typing import List, Optional, Dict, Tuple, Set
 from dataclasses import dataclass
+from typing import Optional, Dict, List, Tuple, Set
 
-# ---------------------
-# Constants
-# ---------------------
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'character_data')
-DATABASE_PATH = os.path.join(DATA_DIR, 'vendors_auto.db')
-DEFAULT_CHARACTER = 'Default'
-MAX_DAYS = 6
-MAX_HOURS = 23
-MAX_MINUTES = 59
-MAX_TOTAL_MINUTES = MAX_DAYS * 24 * 60 + MAX_HOURS * 60 + MAX_MINUTES
+try:
+    import pandas as pd
+except ImportError:
+    print("ERROR: pandas is required. Install with: pip install pandas")
+    raise
 
-# Invalid council maximum threshold (2^31 - 1, likely overflow/invalid value)
-INVALID_MAX_COUNCIL = 2147483647
+from playerlog_reader import PlayerLogReader
 
-# Default Player.log path (Windows)
+# Configuration
 DEFAULT_LOG_PATH = os.path.expandvars(r'C:\Users\%USERNAME%\AppData\LocalLow\Elder Game\Project Gorgon\Player.log')
-SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, 'damage_parser.cfg')
+ALIASES_PATH = os.path.join(SCRIPT_DIR, 'damage_parser_aliases.json')
 
-# UI Constants
-VENDOR_CATEGORIES = ["Jewelry", "Armor", "Weapons", "Scrolls", "Misc"]
-PULSE_FRAME_MAX = 120
-PULSE_CYCLE_DIVISOR = 30
-TIMER_UPDATE_MS = 1000
-PULSE_UPDATE_MS = 100
-AUTO_SCAN_INTERVAL_MS = 2000  # Check for new log data every 2 seconds
+# Regex patterns
+TIMESTAMP_PATTERN = re.compile(r'^\[(\d{2}:\d{2}:\d{2})\]')
+ZONE_PATTERNS = [
+    re.compile(r'^\[(\d{2}:\d{2}:\d{2})\].*LOADING LEVEL (Area\w+)'),
+    re.compile(r'^\[(\d{2}:\d{2}:\d{2})\].*Initializing area!.*:\s*(Area\w+)'),
+    re.compile(r'^\[(\d{2}:\d{2}:\d{2})\].*C_INIT2 for (Area\w+)')
+]
+CHARACTER_PATTERN = re.compile(r'Vivox - LoginAsync\((\w+)\)')
+# New format: ProcessTalkScreen(npc_id, "Search Corpse of NPC_NAME", "...Detailed Analysis:\nPlayer: N health dmg...", ...)
+CORPSE_PATTERN = re.compile(r'ProcessTalkScreen\((\d+),\s*"Search Corpse of ([^"]+)",\s*"([^"]*)"')
+# Damage entry pattern for lines within the detailed analysis section
+DAMAGE_PATTERN = re.compile(r'^([^:]+):\s*(?:(\d+)\s+health\s+dmg)?\s*(?:(\d+)\s+armor\s+dmg)?(?:.*?Aggro\s*\(at death\):\s*([\d.]+)%)?')
+WISDOM_PATTERN = re.compile(r'You earned (\d+) Combat Wisdom')
 
-# Colors
-COLOR_EMPTY_BG = "lightgrey"
-COLOR_NORMAL_BG = "white"
-COLOR_RESET_READY = "green"
+SKIP_ZONES = frozenset(['ChooseCharacter', 'ReconnectToServer', 'LoadingScene'])
+BATCH_SIZE = 1000
+TIMEZONE_OPTIONS = {'UTC': 0, 'EST (UTC-5)': -5, 'EDT (UTC-4)': -4, 'CST (UTC-6)': -6,
+                    'CDT (UTC-5)': -5, 'MST (UTC-7)': -7, 'MDT (UTC-6)': -6, 'PST (UTC-8)': -8, 'PDT (UTC-7)': -7}
 
-# Regex patterns for log parsing
-PATTERN_LOGIN = re.compile(r'Vivox - LoginAsync\(([A-Za-z][A-Za-z0-9_]*)\)')
-PATTERN_AREA = re.compile(r'Initializing area! \(\d+\): Area(\w+)')
-PATTERN_INTERACTION = re.compile(r'LocalPlayer: ProcessStartInteraction\((\d+),.*?,.*?,.*?, (NPC_[^,]+),')
-PATTERN_VENDOR_SCREEN = re.compile(r'LocalPlayer: ProcessVendorScreen\((\d+), ([^,]+), (\d+), (\d+), (\d+),')
-PATTERN_VENDOR_UPDATE_GOLD = re.compile(r'LocalPlayer: ProcessVendorUpdateAvailableGold\((\d+), (\d+), (\d+),')
+# Utility functions
+def format_damage_short(value: int) -> str:
+    if value >= 1_000_000: return f"{value/1_000_000:.1f}M"
+    elif value >= 1_000: return f"{value/1_000:.1f}K"
+    return str(value)
 
+def group_damage_by_alias(data: List[Dict]) -> List[Dict]:
+    if not data: return []
+    grouped = {}
+    for d in data:
+        key = d['display_name']
+        if key not in grouped:
+            grouped[key] = {'display_name': key, 'health_dmg': 0, 'armor_dmg': 0, 'total_dmg': 0,
+                           'weighted_aggro': 0, 'kills': 0, 'first_hit': None, 'last_hit': None}
+        g = grouped[key]
+        g['health_dmg'] += d['health_dmg']; g['armor_dmg'] += d['armor_dmg']
+        g['total_dmg'] += d['total_dmg']; g['weighted_aggro'] += d.get('weighted_aggro', 0); g['kills'] += d['kills']
+        if d['first_hit'] and (g['first_hit'] is None or d['first_hit'] < g['first_hit']): g['first_hit'] = d['first_hit']
+        if d['last_hit'] and (g['last_hit'] is None or d['last_hit'] > g['last_hit']): g['last_hit'] = d['last_hit']
+    return sorted(grouped.values(), key=lambda x: x['total_dmg'], reverse=True)
 
-# ---------------------
-# Data Classes
-# ---------------------
-@dataclass
-class TimeUntilReset:
-    """Wrapper for time until reset calculations."""
-    days: int
-    hours: int
-    minutes: int
-    
-    @classmethod
-    def from_timedelta(cls, td: timedelta) -> 'TimeUntilReset':
-        """Create from timedelta object."""
-        total_seconds = max(0, int(td.total_seconds()))
-        days = total_seconds // (24 * 3600)
-        remainder = total_seconds % (24 * 3600)
-        hours = remainder // 3600
-        minutes = (remainder % 3600) // 60
-        return cls(days, hours, minutes)
-    
-    @classmethod
-    def from_inputs(cls, days: int, hours: int, minutes: int, override_max: bool = False) -> 'TimeUntilReset':
-        """Create from user inputs with optional clamping."""
-        d = max(0, int(days or 0))
-        h = max(0, int(hours or 0))
-        m = max(0, int(minutes or 0))
-        
-        if not override_max:
-            total_minutes = d * 24 * 60 + h * 60 + m
-            if total_minutes > MAX_TOTAL_MINUTES:
-                total_minutes = MAX_TOTAL_MINUTES
-            d, remainder = divmod(total_minutes, 24 * 60)
-            h, m = divmod(remainder, 60)
-        else:
-            h = min(h, 23)
-            m = min(m, 59)
-        
-        return cls(int(d), int(h), int(m))
-    
-    @classmethod
-    def from_reset_timestamp_ms(cls, reset_timestamp_ms: int) -> 'TimeUntilReset':
-        """Create from Unix millisecond timestamp of reset time."""
-        if reset_timestamp_ms == 0:
-            # Vendor just reset, full 7 days
-            return cls(6, 23, 59)
-        
-        reset_time = datetime.fromtimestamp(reset_timestamp_ms / 1000.0)
-        now = datetime.now()
-        td = reset_time - now
-        
-        if td.total_seconds() <= 0:
-            return cls(0, 0, 0)
-        
-        return cls.from_timedelta(td)
-    
-    def to_timedelta(self) -> timedelta:
-        """Convert to timedelta."""
-        return timedelta(days=self.days, hours=self.hours, minutes=self.minutes)
-    
-    def to_string(self) -> str:
-        """Format as string."""
-        return f"{self.days}d {self.hours}h {self.minutes}m"
-    
-    def calculate_last_reset(self, override_max: bool = False) -> datetime:
-        """Calculate when the last reset occurred."""
-        time_until_reset = self.to_timedelta()
-        if not override_max:
-            time_since_last_reset = timedelta(days=7) - time_until_reset
-            return datetime.now() - time_since_last_reset
-        else:
-            return datetime.now() + time_until_reset - timedelta(days=7)
-
-
-@dataclass
-class ScanResult:
-    """Results from scanning the Player.log file."""
-    characters_found: Set[str]
-    npc_mappings: Dict[int, str]  # NPC_ID -> clean name (without NPC_ prefix)
-    npc_zones: Dict[int, str]  # NPC_ID -> zone name
-    vendor_data: Dict[str, Dict[int, Tuple[int, int, int]]]  # character -> {npc_id: (council_left, reset_ts_ms, max_council)}
-    errors: List[str]
-
-
-# ---------------------
-# Log Watcher (Incremental Scanner)
-# ---------------------
-class LogWatcher:
-    """Efficiently watches Player.log for new vendor data by reading only new lines."""
-    
-    def __init__(self, log_path: str, on_update_callback):
-        self.log_path = log_path
-        self.on_update_callback = on_update_callback
-        
-        # File tracking state
-        self.last_position = 0
-        self.last_size = 0
-        self.last_modified = 0
-        
-        # Parsing state (persistent across reads)
-        self.current_character: Optional[str] = None
-        self.current_zone: str = "Unknown"
-        self.current_vendor_npc_id: Optional[int] = None
-        
-        # Accumulated data
-        self.characters_found: Set[str] = set()
-        self.npc_mappings: Dict[int, str] = {}
-        self.npc_zones: Dict[int, str] = {}
-        self.vendor_data: Dict[str, Dict[int, Tuple[int, int, int]]] = {}
-        
-        # Track what changed in last scan
-        self.last_scan_updates: List[Tuple[str, int, str]] = []  # (character, npc_id, npc_name)
-    
-    def check_for_updates(self) -> bool:
-        """
-        Check for new content in the log file.
-        Returns True if new vendor data was found.
-        """
-        if not os.path.exists(self.log_path):
-            return False
-        
+def load_config() -> Dict:
+    config = {'timezone': 'EST (UTC-5)'}
+    if os.path.exists(CONFIG_PATH):
         try:
-            stat = os.stat(self.log_path)
-            current_size = stat.st_size
-            current_modified = stat.st_mtime
-            
-            # Check if file was rotated/truncated (size decreased)
-            if current_size < self.last_size:
-                # File was reset, start from beginning
-                self.last_position = 0
-                self.last_size = 0
-            
-            # Check if there's new content
-            if current_size <= self.last_position:
-                return False
-            
-            # Read only the new content
-            updates_found = self._read_new_content()
-            
-            self.last_size = current_size
-            self.last_modified = current_modified
-            
-            return updates_found
-            
-        except (OSError, IOError) as e:
-            # File might be locked by the game, try again later
-            return False
-    
-    def _read_new_content(self) -> bool:
-        """Read new lines from the log file. Returns True if vendor data was updated."""
-        self.last_scan_updates.clear()
-        updates_found = False
-        
-        try:
-            with open(self.log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                # Seek to last known position
-                f.seek(self.last_position)
-                
+            with open(CONFIG_PATH, 'r') as f:
                 for line in f:
-                    if self._process_line(line):
-                        updates_found = True
-                
-                # Update position for next read
-                self.last_position = f.tell()
-            
-            return updates_found
-            
-        except (OSError, IOError):
-            return False
-    
-    def _process_line(self, line: str) -> bool:
-        """Process a single log line. Returns True if vendor data was updated."""
-        # Check for character login
-        login_match = PATTERN_LOGIN.search(line)
-        if login_match:
-            char_name = login_match.group(1)
-            if not char_name.isdigit():
-                self.current_character = char_name
-                self.characters_found.add(char_name)
-                if char_name not in self.vendor_data:
-                    self.vendor_data[char_name] = {}
-            return False
-        
-        # Check for area/zone change
-        area_match = PATTERN_AREA.search(line)
-        if area_match:
-            self.current_zone = area_match.group(1)
-            return False
-        
-        # Check for NPC interaction
-        interaction_match = PATTERN_INTERACTION.search(line)
-        if interaction_match:
-            npc_id = int(interaction_match.group(1))
-            npc_name_raw = interaction_match.group(2)
-            npc_name = npc_name_raw[4:] if npc_name_raw.startswith('NPC_') else npc_name_raw
-            self.npc_mappings[npc_id] = npc_name
-            
-            # VendorFox exception
-            if npc_name == 'VendorFox':
-                self.npc_zones[npc_id] = 'Anywhere'
-            else:
-                self.npc_zones[npc_id] = self.current_zone
-            return False
-        
-        # Check for vendor screen (opens vendor)
-        vendor_match = PATTERN_VENDOR_SCREEN.search(line)
-        if vendor_match and self.current_character:
-            npc_id = int(vendor_match.group(1))
-            council_left = int(vendor_match.group(3))
-            reset_ts_ms = int(vendor_match.group(4))
-            max_council = int(vendor_match.group(5))
-            
-            # Check for invalid max_council value and replace both with 0
-            if max_council >= INVALID_MAX_COUNCIL:
-                max_council = 0
-                council_left = 0
-            
-            self.vendor_data[self.current_character][npc_id] = (council_left, reset_ts_ms, max_council)
-            self.current_vendor_npc_id = npc_id
-            
-            npc_name = self.npc_mappings.get(npc_id, f"Unknown_{npc_id}")
-            self.last_scan_updates.append((self.current_character, npc_id, npc_name))
-            return True
-        
-        # Check for vendor gold update (after selling)
-        update_match = PATTERN_VENDOR_UPDATE_GOLD.search(line)
-        if update_match and self.current_character and self.current_vendor_npc_id is not None:
-            council_left = int(update_match.group(1))
-            reset_ts_ms = int(update_match.group(2))
-            max_council = int(update_match.group(3))
-            
-            # Check for invalid max_council value and replace both with 0
-            if max_council >= INVALID_MAX_COUNCIL:
-                max_council = 0
-                council_left = 0
-            
-            self.vendor_data[self.current_character][self.current_vendor_npc_id] = (council_left, reset_ts_ms, max_council)
-            
-            npc_name = self.npc_mappings.get(self.current_vendor_npc_id, f"Unknown_{self.current_vendor_npc_id}")
-            self.last_scan_updates.append((self.current_character, self.current_vendor_npc_id, npc_name))
-            return True
-        
-        return False
-    
-    def get_scan_result(self) -> ScanResult:
-        """Get current accumulated data as a ScanResult."""
-        return ScanResult(
-            self.characters_found.copy(),
-            self.npc_mappings.copy(),
-            self.npc_zones.copy(),
-            {char: vendors.copy() for char, vendors in self.vendor_data.items()},
-            []
-        )
-    
-    def reset(self):
-        """Reset the watcher to re-read from the beginning."""
-        self.last_position = 0
-        self.last_size = 0
-        self.current_character = None
-        self.current_zone = "Unknown"
-        self.current_vendor_npc_id = None
+                    if '=' in line: k, v = line.strip().split('=', 1); config[k] = v
+        except: pass
+    return config
 
-
-# ---------------------
-# Log Scanner (Full File Scan)
-# ---------------------
-class PlayerLogScanner:
-    """Scans Player.log to extract vendor information."""
-    
-    def __init__(self, log_path: str):
-        self.log_path = log_path
-    
-    def scan(self) -> ScanResult:
-        """Scan the log file and extract vendor data."""
-        characters_found: Set[str] = set()
-        npc_mappings: Dict[int, str] = {}
-        npc_zones: Dict[int, str] = {}
-        vendor_data: Dict[str, Dict[int, Tuple[int, int, int]]] = {}
-        errors: List[str] = []
-        
-        current_character: Optional[str] = None
-        current_zone: str = "Unknown"
-        current_vendor_npc_id: Optional[int] = None  # Track the currently open vendor
-        
-        if not os.path.exists(self.log_path):
-            errors.append(f"Log file not found: {self.log_path}")
-            return ScanResult(characters_found, npc_mappings, npc_zones, vendor_data, errors)
-        
-        try:
-            with open(self.log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line_num, line in enumerate(f, 1):
-                    try:
-                        # Check for character login
-                        login_match = PATTERN_LOGIN.search(line)
-                        if login_match:
-                            char_name = login_match.group(1)
-                            # Skip numeric IDs (like Steam IDs)
-                            if not char_name.isdigit():
-                                current_character = char_name
-                                characters_found.add(char_name)
-                                if char_name not in vendor_data:
-                                    vendor_data[char_name] = {}
-                            continue
-                        
-                        # Check for area/zone change
-                        area_match = PATTERN_AREA.search(line)
-                        if area_match:
-                            current_zone = area_match.group(1)
-                            continue
-                        
-                        # Check for NPC interaction (mapping ID to name and zone)
-                        interaction_match = PATTERN_INTERACTION.search(line)
-                        if interaction_match:
-                            npc_id = int(interaction_match.group(1))
-                            npc_name_raw = interaction_match.group(2)
-                            # Remove NPC_ prefix if present
-                            if npc_name_raw.startswith('NPC_'):
-                                npc_name = npc_name_raw[4:]
-                            else:
-                                npc_name = npc_name_raw
-                            npc_mappings[npc_id] = npc_name
-                            # Associate zone with this NPC (VendorFox is special - can be anywhere)
-                            if npc_name == 'VendorFox':
-                                npc_zones[npc_id] = 'Anywhere'
-                            else:
-                                npc_zones[npc_id] = current_zone
-                            continue
-                        
-                        # Check for vendor screen (council data) - this opens a vendor
-                        vendor_match = PATTERN_VENDOR_SCREEN.search(line)
-                        if vendor_match and current_character:
-                            npc_id = int(vendor_match.group(1))
-                            # group(2) is category like SoulMates - not used
-                            council_left = int(vendor_match.group(3))
-                            reset_ts_ms = int(vendor_match.group(4))
-                            max_council = int(vendor_match.group(5))
-                            
-                            # Check for invalid max_council value and replace both with 0
-                            if max_council >= INVALID_MAX_COUNCIL:
-                                max_council = 0
-                                council_left = 0
-                            
-                            # Store vendor data for current character
-                            vendor_data[current_character][npc_id] = (council_left, reset_ts_ms, max_council)
-                            
-                            # Track this as the currently open vendor
-                            current_vendor_npc_id = npc_id
-                            continue
-                        
-                        # Check for vendor gold update (after selling items)
-                        update_match = PATTERN_VENDOR_UPDATE_GOLD.search(line)
-                        if update_match and current_character and current_vendor_npc_id is not None:
-                            council_left = int(update_match.group(1))
-                            reset_ts_ms = int(update_match.group(2))
-                            max_council = int(update_match.group(3))
-                            
-                            # Check for invalid max_council value and replace both with 0
-                            if max_council >= INVALID_MAX_COUNCIL:
-                                max_council = 0
-                                council_left = 0
-                            
-                            # Update the currently open vendor's data
-                            vendor_data[current_character][current_vendor_npc_id] = (council_left, reset_ts_ms, max_council)
-                            continue
-                    
-                    except Exception as e:
-                        errors.append(f"Line {line_num}: {str(e)}")
-        
-        except Exception as e:
-            errors.append(f"Error reading log file: {str(e)}")
-        
-        return ScanResult(characters_found, npc_mappings, npc_zones, vendor_data, errors)
-
-
-# ---------------------
-# Database Layer
-# ---------------------
-class VendorDatabase:
-    """Handles all database operations."""
-    
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._ensure_data_dir()
-        self.init_database()
-    
-    def _ensure_data_dir(self):
-        """Ensure data directory exists."""
-        data_dir = os.path.dirname(self.db_path)
-        try:
-            if not os.path.exists(data_dir):
-                os.makedirs(data_dir)
-        except OSError as e:
-            raise RuntimeError(f"Could not create data directory: {e}")
-    
-    def init_database(self):
-        """Initialize database tables."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # NPC ID to Name mapping table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS npc_mappings (
-                        npc_id INTEGER PRIMARY KEY,
-                        npc_name TEXT NOT NULL,
-                        zone TEXT DEFAULT '',
-                        last_updated TEXT NOT NULL
-                    )
-                ''')
-                
-                # Vendors table (per character) - identified by name+zone, not npc_id
-                # npc_id is stored for reference but not as unique key since the game
-                # assigns different IDs to the same NPC in different sessions
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS vendors (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        character_name TEXT NOT NULL,
-                        npc_id INTEGER NOT NULL,
-                        npc_name TEXT NOT NULL,
-                        zone TEXT NOT NULL,
-                        council_left INTEGER NOT NULL,
-                        last_reset TEXT NOT NULL,
-                        reset_maximum INTEGER NOT NULL,
-                        categories TEXT NOT NULL,
-                        muted BOOLEAN NOT NULL,
-                        UNIQUE(character_name, npc_name, zone)
-                    )
-                ''')
-                
-                # Transactions table
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS transactions (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        character_name TEXT NOT NULL,
-                        vendor_name TEXT NOT NULL,
-                        npc_id INTEGER,
-                        transaction_type TEXT NOT NULL,
-                        council_before INTEGER NOT NULL,
-                        council_after INTEGER NOT NULL,
-                        council_change INTEGER NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        notes TEXT
-                    )
-                ''')
-                
-                cursor.execute('''
-                    CREATE INDEX IF NOT EXISTS idx_transactions_lookup 
-                    ON transactions(character_name, vendor_name, timestamp)
-                ''')
-                
-                cursor.execute('''
-                    CREATE INDEX IF NOT EXISTS idx_vendors_character 
-                    ON vendors(character_name)
-                ''')
-                
-                # Check if we need to migrate from old schema (npc_id unique) to new (name+zone unique)
-                self._migrate_to_name_zone_unique(conn)
-                
-                conn.commit()
-        except sqlite3.Error as e:
-            raise RuntimeError(f"Could not initialize database: {e}")
-    
-    def _migrate_to_name_zone_unique(self, conn):
-        """
-        Migrate from old schema (UNIQUE on npc_id) to new schema (UNIQUE on name+zone).
-        This consolidates duplicate vendors that have the same name and zone but different npc_ids.
-        """
-        cursor = conn.cursor()
-        
-        # Check if migration is needed by looking for duplicates
-        cursor.execute('''
-            SELECT character_name, npc_name, zone, COUNT(*) as cnt
-            FROM vendors
-            GROUP BY character_name, npc_name, zone
-            HAVING cnt > 1
-        ''')
-        duplicates = cursor.fetchall()
-        
-        if not duplicates:
-            return  # No migration needed
-        
-        print(f"Migrating database: consolidating {len(duplicates)} duplicate vendor groups...")
-        
-        for char_name, npc_name, zone, count in duplicates:
-            # Get all duplicate entries for this vendor
-            cursor.execute('''
-                SELECT id, npc_id, council_left, last_reset, reset_maximum, categories, muted
-                FROM vendors
-                WHERE character_name = ? AND npc_name = ? AND zone = ?
-                ORDER BY last_reset DESC
-            ''', (char_name, npc_name, zone))
-            rows = cursor.fetchall()
-            
-            if len(rows) <= 1:
-                continue
-            
-            # Keep the entry with the most recent last_reset, but use highest reset_maximum
-            # and most recent council_left
-            keep_id = rows[0][0]
-            keep_npc_id = rows[0][1]
-            best_council_left = rows[0][2]
-            best_last_reset = rows[0][3]
-            best_reset_maximum = max(row[4] for row in rows)
-            keep_categories = rows[0][5]
-            keep_muted = rows[0][6]
-            
-            # Find most recent npc_id (highest is usually most recent)
-            best_npc_id = max(row[1] for row in rows)
-            
-            # Update the kept row with best values
-            cursor.execute('''
-                UPDATE vendors
-                SET npc_id = ?, council_left = ?, reset_maximum = ?
-                WHERE id = ?
-            ''', (best_npc_id, best_council_left, best_reset_maximum, keep_id))
-            
-            # Delete the duplicate rows
-            ids_to_delete = [row[0] for row in rows if row[0] != keep_id]
-            for del_id in ids_to_delete:
-                cursor.execute('DELETE FROM vendors WHERE id = ?', (del_id,))
-            
-            print(f"  Consolidated {count} entries for {npc_name} ({zone}) -> kept npc_id {best_npc_id}")
-        
-        conn.commit()
-        print("Migration complete.")
-    
-    def save_npc_mapping(self, npc_id: int, npc_name: str, zone: str = ''):
-        """Save or update NPC ID to name mapping."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT OR REPLACE INTO npc_mappings (npc_id, npc_name, zone, last_updated)
-                    VALUES (?, ?, ?, ?)
-                ''', (npc_id, npc_name, zone, datetime.now().isoformat()))
-                conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error saving NPC mapping: {e}")
-    
-    def get_npc_name(self, npc_id: int) -> Optional[str]:
-        """Get NPC name from ID."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT npc_name FROM npc_mappings WHERE npc_id = ?', (npc_id,))
-                row = cursor.fetchone()
-                return row[0] if row else None
-        except sqlite3.Error as e:
-            print(f"Error getting NPC name: {e}")
-            return None
-    
-    def get_npc_zone(self, npc_id: int) -> str:
-        """Get NPC zone from ID."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT zone FROM npc_mappings WHERE npc_id = ?', (npc_id,))
-                row = cursor.fetchone()
-                return row[0] if row and row[0] else 'Unknown'
-        except sqlite3.Error as e:
-            print(f"Error getting NPC zone: {e}")
-            return 'Unknown'
-    
-    def update_npc_zone(self, npc_id: int, zone: str):
-        """Update zone for an NPC."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    UPDATE npc_mappings SET zone = ?, last_updated = ? WHERE npc_id = ?
-                ''', (zone, datetime.now().isoformat(), npc_id))
-                conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error updating NPC zone: {e}")
-    
-    def save_vendors(self, vendors: List['Vendor'], character_name: str):
-        """Save vendors for a character."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('DELETE FROM vendors WHERE character_name = ?', (character_name,))
-                for vendor in vendors:
-                    cursor.execute('''
-                        INSERT INTO vendors (
-                            character_name, npc_id, npc_name, zone, council_left,
-                            last_reset, reset_maximum, categories, muted
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        character_name,
-                        vendor.npc_id,
-                        vendor.name,
-                        vendor.zone,
-                        vendor.council_left,
-                        vendor.last_reset.isoformat(),
-                        vendor.reset_maximum,
-                        json.dumps(vendor.categories),
-                        vendor.muted
-                    ))
-                conn.commit()
-        except sqlite3.Error as e:
-            raise RuntimeError(f"Could not save vendors: {e}")
-    
-    def load_vendors(self, character_name: str) -> List['Vendor']:
-        """Load vendors for a character."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT npc_id, npc_name, zone, council_left, last_reset, 
-                           reset_maximum, categories, muted 
-                    FROM vendors WHERE character_name = ?
-                ''', (character_name,))
-                rows = cursor.fetchall()
-                
-                vendors = []
-                for row in rows:
-                    try:
-                        vendor = Vendor(
-                            npc_id=row[0],
-                            name=row[1],
-                            zone=row[2],
-                            council_left=row[3],
-                            last_reset=row[4],
-                            reset_maximum=row[5],
-                            categories=json.loads(row[6]),
-                            muted=row[7]
-                        )
-                        vendors.append(vendor)
-                    except (ValueError, json.JSONDecodeError) as e:
-                        print(f"Error loading vendor {row[1]}: {e}")
-                
-                return vendors
-        except sqlite3.Error as e:
-            raise RuntimeError(f"Could not load vendors for {character_name}: {e}")
-    
-    def get_vendor_by_npc_id(self, character_name: str, npc_id: int) -> Optional['Vendor']:
-        """Get a specific vendor by NPC ID (legacy method, prefer get_vendor_by_name_zone)."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT npc_id, npc_name, zone, council_left, last_reset, 
-                           reset_maximum, categories, muted 
-                    FROM vendors WHERE character_name = ? AND npc_id = ?
-                ''', (character_name, npc_id))
-                row = cursor.fetchone()
-                
-                if row:
-                    return Vendor(
-                        npc_id=row[0],
-                        name=row[1],
-                        zone=row[2],
-                        council_left=row[3],
-                        last_reset=row[4],
-                        reset_maximum=row[5],
-                        categories=json.loads(row[6]),
-                        muted=row[7]
-                    )
-                return None
-        except sqlite3.Error as e:
-            print(f"Error getting vendor: {e}")
-            return None
-    
-    def get_vendor_by_name_zone(self, character_name: str, npc_name: str, zone: str) -> Optional['Vendor']:
-        """Get a specific vendor by name and zone (the canonical lookup method)."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT npc_id, npc_name, zone, council_left, last_reset, 
-                           reset_maximum, categories, muted 
-                    FROM vendors WHERE character_name = ? AND npc_name = ? AND zone = ?
-                ''', (character_name, npc_name, zone))
-                row = cursor.fetchone()
-                
-                if row:
-                    return Vendor(
-                        npc_id=row[0],
-                        name=row[1],
-                        zone=row[2],
-                        council_left=row[3],
-                        last_reset=row[4],
-                        reset_maximum=row[5],
-                        categories=json.loads(row[6]),
-                        muted=row[7]
-                    )
-                return None
-        except sqlite3.Error as e:
-            print(f"Error getting vendor by name/zone: {e}")
-            return None
-    
-    def get_all_characters(self) -> List[str]:
-        """Get all unique character names."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT DISTINCT character_name FROM vendors')
-                characters = [row[0] for row in cursor.fetchall()]
-                if DEFAULT_CHARACTER not in characters:
-                    characters.append(DEFAULT_CHARACTER)
-                return sorted(characters)
-        except sqlite3.Error as e:
-            print(f"Error fetching characters: {e}")
-            return [DEFAULT_CHARACTER]
-    
-    def log_transaction(self, character_name: str, vendor_name: str, 
-                        transaction_type: str, council_before: int, 
-                        council_after: int, notes: Optional[str] = None,
-                        npc_id: Optional[int] = None):
-        """Log a transaction."""
-        try:
-            council_change = council_after - council_before
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO transactions (
-                        character_name, vendor_name, npc_id, transaction_type,
-                        council_before, council_after, council_change,
-                        timestamp, notes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    character_name, vendor_name, npc_id, transaction_type,
-                    council_before, council_after, council_change,
-                    datetime.now().isoformat(), notes
-                ))
-                conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error logging transaction: {e}")
-    
-    def get_council_earned(self, character_name: str, 
-                           vendor_name: Optional[str] = None, 
-                           days: int = 7) -> int:
-        """
-        Get total council earned in the last N days by summing negative 
-        council_change values from transactions (negative = you sold to vendor = earned).
-        This matches the logic used in the Daily Earnings tab of Transaction History.
-        """
-        try:
-            cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                if vendor_name:
-                    cursor.execute('''
-                        SELECT COALESCE(SUM(ABS(council_change)), 0) FROM transactions
-                        WHERE character_name = ? AND vendor_name = ?
-                        AND timestamp >= ?
-                        AND council_change < 0
-                        AND transaction_type != 'deletion'
-                    ''', (character_name, vendor_name, cutoff_date))
-                else:
-                    cursor.execute('''
-                        SELECT COALESCE(SUM(ABS(council_change)), 0) FROM transactions
-                        WHERE character_name = ?
-                        AND timestamp >= ?
-                        AND council_change < 0
-                        AND transaction_type != 'deletion'
-                    ''', (character_name, cutoff_date))
-                
-                return cursor.fetchone()[0]
-        except sqlite3.Error as e:
-            print(f"Error getting council earned: {e}")
-            return 0
-    
-                                                              
-                                                                      
-                                                     
-                          
-                                                             
-                                                        
-                                                                                                
-                                  
-                                                        
-                                  
-                                                         
-        
-                          
-                                                           
-                                                     
-                                           
-                                      
-        
-                      
-                                                    
-                                                        
-            
-                              
-                                                 
-                                                            
-                                  
-                                                            
-            
-                                         
-                                      
-        
-                    
-    
-                                                                                            
-                                               
-                        
-                          
-                                                                     
-                                    
-                               
-                                   
-        
-                                                                
-                              
-                                                                 
-                                                            
-                                                                                                    
-                                      
-                                                            
-                                      
-                                                             
-            
-                                                        
-                              
-                                                 
-                                                            
-                                  
-                                                            
-            
-                                         
-                                      
-            
-                                 
-        
-                           
-    
-    def get_transactions(self, character_name: str, 
-                         vendor_name: Optional[str] = None,
-                         start_date: Optional[datetime] = None,
-                         end_date: Optional[datetime] = None) -> List[Tuple]:
-        """Query transactions within a timeframe."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                query = 'SELECT * FROM transactions WHERE character_name = ?'
-                params = [character_name]
-                
-                if vendor_name:
-                    query += ' AND vendor_name = ?'
-                    params.append(vendor_name)
-                
-                if start_date:
-                    query += ' AND timestamp >= ?'
-                    params.append(start_date.isoformat() if isinstance(start_date, datetime) else start_date)
-                
-                if end_date:
-                    query += ' AND timestamp <= ?'
-                    params.append(end_date.isoformat() if isinstance(end_date, datetime) else end_date)
-                
-                query += ' ORDER BY timestamp DESC'
-                
-                cursor.execute(query, params)
-                return cursor.fetchall()
-        except sqlite3.Error as e:
-            print(f"Error querying transactions: {e}")
-            return []
-
-
-# ---------------------
-# Settings Manager
-# ---------------------
-class SettingsManager:
-    """Manages application settings."""
-    
-    def __init__(self, settings_path: str):
-        self.settings_path = settings_path
-        self.settings = self._load_settings()
-    
-    def _load_settings(self) -> Dict:
-        """Load settings from file."""
-        default_settings = {
-            'log_path': DEFAULT_LOG_PATH
-        }
-        
-        if os.path.exists(self.settings_path):
-            try:
-                with open(self.settings_path, 'r') as f:
-                    loaded = json.load(f)
-                    default_settings.update(loaded)
-            except (json.JSONDecodeError, IOError) as e:
-                print(f"Error loading settings: {e}")
-        
-        return default_settings
-    
-    def save_settings(self):
-        """Save settings to file."""
-        try:
-            os.makedirs(os.path.dirname(self.settings_path), exist_ok=True)
-            with open(self.settings_path, 'w') as f:
-                json.dump(self.settings, f, indent=2)
-        except IOError as e:
-            print(f"Error saving settings: {e}")
-    
-    def get(self, key: str, default=None):
-        """Get a setting value."""
-        return self.settings.get(key, default)
-    
-    def set(self, key: str, value):
-        """Set a setting value."""
-        self.settings[key] = value
-        self.save_settings()
-
-
-# ---------------------
-# Vendor Model
-# ---------------------
-class Vendor:
-    """Vendor model with business logic."""
-    
-    def __init__(self, name: str, zone: str, council_left: int, 
-                 last_reset, reset_maximum: int = 0, 
-                 categories: Optional[List[str]] = None, 
-                 muted: bool = False,
-                 npc_id: int = 0):
-        self.npc_id = npc_id
-        self.name = name
-        self.zone = zone
-        
-        # Handle invalid maximum values - if reset_maximum is invalid, set both to 0
-        if reset_maximum >= INVALID_MAX_COUNCIL:
-            reset_maximum = 0
-            council_left = 0
-        
-        self.council_left = int(council_left)
-        self.last_reset = self._parse_last_reset(last_reset, name)
-        self.reset_maximum = int(reset_maximum)
-        self.categories = categories or []
-        self.muted = bool(muted)
-    
-    @staticmethod
-    def _parse_last_reset(last_reset, vendor_name: str) -> datetime:
-        """Parse last_reset into datetime."""
-        if isinstance(last_reset, str):
-            try:
-                return datetime.fromisoformat(last_reset)
-            except ValueError:
-                try:
-                    return datetime.fromtimestamp(float(last_reset))
-                except (ValueError, OverflowError):
-                    print(f"Warning: Invalid last_reset for {vendor_name}, using current time")
-                    return datetime.now()
-        elif isinstance(last_reset, datetime):
-            return last_reset
-        else:
-            print(f"Warning: Unknown last_reset type for {vendor_name}, using current time")
-            return datetime.now()
-    
-    @classmethod
-    def from_scan_data(cls, npc_id: int, npc_name: str, zone: str,
-                       council_left: int, reset_ts_ms: int, max_council: int) -> 'Vendor':
-        """Create a Vendor from scanned log data."""
-        # Check for invalid max_council and replace both values with 0
-        if max_council >= INVALID_MAX_COUNCIL:
-            max_council = 0
-            council_left = 0
-        
-        if reset_ts_ms == 0:
-            # Vendor at full, assume just reset (or within 7 days)
-            last_reset = datetime.now()
-        else:
-            # Calculate last reset from the reset timestamp
-            reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
-            last_reset = reset_time - timedelta(days=7)
-        
-        return cls(
-            npc_id=npc_id,
-            name=npc_name,
-            zone=zone,
-            council_left=council_left,
-            last_reset=last_reset,
-            reset_maximum=max_council,
-            categories=[],
-            muted=False
-        )
-    
-    @property
-    def next_reset(self) -> datetime:
-        """Calculate next reset time."""
-        return self.last_reset + timedelta(days=7)
-    
-    @property
-    def is_ready_to_reset(self) -> bool:
-        """Check if vendor is ready to reset."""
-        return datetime.now() >= self.next_reset
-    
-    @property
-    def is_empty(self) -> bool:
-        """Check if vendor has no council left (under 1k treated as empty)."""
-        return self.council_left < 1000
-    
-    @property
-    def time_until_reset(self) -> TimeUntilReset:
-        """Get time until next reset."""
-        return TimeUntilReset.from_timedelta(self.next_reset - datetime.now())
-    
-    def matches_filter(self, filter_text: str) -> bool:
-        """
-        Check if vendor matches filter text.
-        Supports multi-term searching with AND logic.
-        """
-        if not filter_text:
-            return True
-
-        search_terms = filter_text.lower().split()
-        vendor_info = " ".join([
-            self.name.lower(),
-            self.zone.lower(),
-            *map(str.lower, self.categories)
-        ])
-
-        return all(term in vendor_info for term in search_terms)
-
-
-# ---------------------
-# Utility Functions
-# ---------------------
-def format_number(value) -> str:
-    """Format number with K/M suffixes."""
+def save_config(config: Dict):
     try:
-        value = int(value)
-    except (ValueError, TypeError):
-        return str(value)
-    
-    if value == 0:
-        return "0"
-    elif abs(value) >= 1_000_000:
-        return f"{value / 1_000_000:.1f}M"
-    elif abs(value) >= 1_000:
-        return f"{value // 1000}K"
-    else:
-        return str(value)
+        with open(CONFIG_PATH, 'w') as f:
+            for k, v in config.items(): f.write(f"{k}={v}\n")
+    except: pass
 
-
-def calculate_border_color(vendor: Vendor, min_time: float, max_time: float) -> str:
-    """Calculate border color based on reset time."""
-    if vendor.is_ready_to_reset:
-        return COLOR_RESET_READY
-    
-    time_diff_seconds = (vendor.next_reset - datetime.now()).total_seconds()
-    
-    if max_time > min_time:
-        ratio = (time_diff_seconds - min_time) / (max_time - min_time)
-    else:
-        ratio = 1.0
-    
-    r = int(255 * (1 - ratio))
-    g = int(255 * ratio)
-    b = 0
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def calculate_pulse_color(frame: int) -> str:
-    """Calculate pulsing color for ready vendors."""
-    import math
-    pulse_ratio = (1 + math.sin(frame * math.pi / PULSE_CYCLE_DIVISOR)) / 2
-    r = int(255 - (255 - 50) * pulse_ratio)
-    g = int(255 - (255 - 205) * pulse_ratio)
-    b = int(0 + 50 * pulse_ratio)
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def format_reset_countdown(reset_ts_ms: int) -> str:
-    """Format reset timestamp as countdown string."""
-    if reset_ts_ms == 0:
-        return "Full (recently reset)"
-    
-    reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
-    now = datetime.now()
-    td = reset_time - now
-    
-    if td.total_seconds() <= 0:
-        return "Ready to reset!"
-    
-    time_obj = TimeUntilReset.from_timedelta(td)
-    return f"Resets in: {time_obj.to_string()}"
-
-
-# ---------------------
-# UI Components
-# ---------------------
-class ScrollableFrame(tk.Frame):
-    """
-    A reusable scrollable frame component that handles mousewheel scrolling reliably
-    by only binding scroll events when the mouse is over the frame.
-    """
-    def __init__(self, parent, **kwargs):
-        super().__init__(parent, **kwargs)
-
-        self.canvas = tk.Canvas(self)
-        self.scrollbar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.scrollable_frame = tk.Frame(self.canvas)
-
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
-
-        self.bind('<Enter>', self._bind_mousewheel)
-        self.bind('<Leave>', self._unbind_mousewheel)
-
-    def _on_mousewheel(self, event):
-        """Handle mousewheel scrolling, compatible with Windows, macOS, and Linux."""
+def load_aliases() -> Dict[str, str]:
+    if os.path.exists(ALIASES_PATH):
         try:
-            if hasattr(event, 'delta'):
-                self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            elif event.num == 4:
-                self.canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                self.canvas.yview_scroll(1, "units")
-        except tk.TclError:
-            pass
+            with open(ALIASES_PATH, 'r') as f: return json.load(f)
+        except: pass
+    return {}
 
-    def _bind_mousewheel(self, event):
-        """Bind mousewheel events when the mouse enters the frame."""
-        self.bind_all("<MouseWheel>", self._on_mousewheel)
-        self.bind_all("<Button-4>", self._on_mousewheel)
-        self.bind_all("<Button-5>", self._on_mousewheel)
+def save_aliases(aliases: Dict[str, str]):
+    try:
+        with open(ALIASES_PATH, 'w') as f: json.dump(aliases, f, indent=2)
+    except: pass
 
-    def _unbind_mousewheel(self, event):
-        """Unbind mousewheel events when the mouse leaves the frame."""
-        self.unbind_all("<MouseWheel>")
-        self.unbind_all("<Button-4>")
-        self.unbind_all("<Button-5>")
+def make_treeview_sortable(tree: ttk.Treeview, preserve_selection: bool = False):
+    def sort_column(col, reverse):
+        saved = tree.selection() if preserve_selection else ()
+        items = [(tree.set(k, col), k) for k in tree.get_children('')]
+        def parse_val(v):
+            v = v.replace(',', '').replace('%', '').replace('★', '').strip()
+            if v in ('--', '(current)', '', '(no alias)'): return float('-inf') if not reverse else float('inf')
+            try: return float(v)
+            except: return v.lower() if isinstance(v, str) else v
+        try: items.sort(key=lambda t: parse_val(t[0]), reverse=reverse)
+        except TypeError: items.sort(key=lambda t: str(t[0]), reverse=reverse)
+        for i, (_, k) in enumerate(items): tree.move(k, '', i)
+        if preserve_selection:
+            for item in saved:
+                if tree.exists(item): tree.selection_add(item)
+        tree.heading(col, command=lambda: sort_column(col, not reverse))
+    for col in tree['columns']: tree.heading(col, command=lambda c=col: sort_column(c, False))
 
+def create_treeview(parent, columns, widths=None, height=20):
+    tree = ttk.Treeview(parent, columns=columns, show='headings', height=height)
+    for i, col in enumerate(columns):
+        tree.heading(col, text=col)
+        w = widths[i] if widths and i < len(widths) else 100
+        tree.column(col, width=w, anchor='w' if i == 0 else 'center')
+    make_treeview_sortable(tree)
+    return tree
 
-class VendorForm:
-    """Reusable form for adding/updating vendors."""
-    
-    def __init__(self, parent, vendor: Optional[Vendor] = None):
-        self.parent = parent
-        self.vendor = vendor
-        self.is_update = vendor is not None
-        
-        self.name_entry = None
-        self.zone_entry = None
-        self.council_entry = None
-        self.days_entry = None
-        self.hours_entry = None
-        self.minutes_entry = None
-        self.max_time_override_var = BooleanVar(value=False)
-        self.muted_var = BooleanVar(value=vendor.muted if vendor else False)
-        self.cat_vars = {}
-        self.custom_var = BooleanVar(value=False)
-        self.custom_entry = None
-    
-    def create_form(self) -> tk.Frame:
-        """Create and return the form frame."""
-        form_frame = tk.Frame(self.parent)
-        
-        if not self.is_update:
-            self._create_name_zone_fields(form_frame)
-        else:
-            Label(form_frame, text=f"Updating {self.vendor.name} ({self.vendor.zone})").pack(
-                padx=10, pady=(8,2), anchor="w"
-            )
-            if self.vendor.npc_id:
-                Label(form_frame, text=f"NPC ID: {self.vendor.npc_id}", fg="gray").pack(
-                    padx=10, pady=(0,2), anchor="w"
-                )
-        
-        self._create_council_field(form_frame)
-        self._create_time_fields(form_frame)
-        self._create_options_and_categories(form_frame)
-        
-        return form_frame
-    
-    def _create_name_zone_fields(self, parent):
-        """Create name and zone entry fields."""
-        Label(parent, text="Vendor Name:").pack(padx=10, pady=(8,2), anchor="w")
-        self.name_entry = Entry(parent)
-        self.name_entry.pack(padx=10, fill=tk.X)
-        
-        Label(parent, text="Vendor Zone:").pack(padx=10, pady=(8,2), anchor="w")
-        self.zone_entry = Entry(parent)
-        self.zone_entry.pack(padx=10, fill=tk.X)
-    
-    def _create_council_field(self, parent):
-        """Create council entry field."""
-        label_text = "New Council left (in K):" if self.is_update else "Council left (in K):"
-        Label(parent, text=label_text).pack(padx=10, anchor="w")
-        self.council_entry = Entry(parent)
-        if self.vendor:
-            self.council_entry.insert(0, str(self.vendor.council_left // 1000))
-        self.council_entry.pack(padx=10, fill=tk.X)
-    
-    def _create_time_fields(self, parent):
-        """Create time input fields."""
-        time_frame = tk.Frame(parent)
-        time_frame.pack(padx=10, pady=8, anchor="w", fill=tk.X)
-        
-        label_text = "Update reset time:" if self.is_update else "Time until reset:"
-        Label(time_frame, text=label_text).pack(side=tk.LEFT)
-        
-        Label(time_frame, text="Days:").pack(side=tk.LEFT, padx=(8,0))
-        self.days_entry = Entry(time_frame, width=5)
-        self.days_entry.pack(side=tk.LEFT, padx=2)
-        
-        Label(time_frame, text="Hours:").pack(side=tk.LEFT, padx=(8,0))
-        self.hours_entry = Entry(time_frame, width=5)
-        self.hours_entry.pack(side=tk.LEFT, padx=2)
-        
-        Label(time_frame, text="Minutes:").pack(side=tk.LEFT, padx=(8,0))
-        self.minutes_entry = Entry(time_frame, width=5)
-        self.minutes_entry.pack(side=tk.LEFT, padx=2)
-        
-        if self.vendor:
-            time_obj = self.vendor.time_until_reset
-            self.days_entry.insert(0, str(max(0, time_obj.days)))
-            self.hours_entry.insert(0, str(max(0, time_obj.hours)))
-            self.minutes_entry.insert(0, str(max(0, time_obj.minutes)))
-        else:
-            self.days_entry.insert(0, '6')
-            self.hours_entry.insert(0, '23')
-            self.minutes_entry.insert(0, '59')
-    
-    def _create_options_and_categories(self, parent):
-        """Create options checkboxes and category selection."""
-        cat_override_row = tk.Frame(parent)
-        cat_override_row.pack(padx=10, pady=6, anchor="w", fill=tk.X)
-        
-        left_options = tk.Frame(cat_override_row)
-        left_options.pack(side=tk.LEFT, padx=(0,12), anchor="n")
-        
-        Checkbutton(left_options, text="Max-Time-Override", 
-                    variable=self.max_time_override_var).pack(anchor="w")
-        
-        mute_text = "Muted" if self.is_update else "Start Muted"
-        Checkbutton(left_options, text=mute_text, 
-                    variable=self.muted_var).pack(anchor="w")
-        
-        cat_area_frame = tk.Frame(cat_override_row)
-        cat_area_frame.pack(side=tk.LEFT, anchor="n")
-        Label(cat_area_frame, text="Categories:").pack(anchor="w")
-        cat_frame = tk.Frame(cat_area_frame)
-        cat_frame.pack(anchor="w", pady=2)
-        
-        vendor_cats = self.vendor.categories if self.vendor else []
-        self.cat_vars = {c: BooleanVar(value=(c in vendor_cats)) for c in VENDOR_CATEGORIES}
-        
-        for i, c in enumerate(VENDOR_CATEGORIES):
-            r, col = divmod(i, 3)
-            cb = Checkbutton(cat_frame, text=c, variable=self.cat_vars[c])
-            cb.grid(row=r, column=col, sticky="w", padx=8, pady=4)
-        
-        custom_wrap = tk.Frame(cat_frame)
-        custom_wrap.grid(row=1, column=2, sticky="w", padx=8, pady=4)
-        cb_custom = Checkbutton(custom_wrap, text="Custom:", variable=self.custom_var)
-        cb_custom.pack(side=tk.LEFT)
-        self.custom_entry = Entry(custom_wrap, width=18)
-        self.custom_entry.pack(side=tk.LEFT, padx=4)
-        
-        if self.vendor:
-            custom_items = [c for c in self.vendor.categories if c not in VENDOR_CATEGORIES]
-            if custom_items:
-                self.custom_var.set(True)
-                self.custom_entry.insert(0, ", ".join(custom_items))
-    
-    def get_values(self) -> Dict:
-        """Extract and validate form values."""
-        values = {}
-        
-        if not self.is_update:
-            values['name'] = self.name_entry.get().strip()
-            values['zone'] = self.zone_entry.get().strip()
-            
-            if not values['name']:
-                raise ValueError("Vendor name cannot be empty.")
-        
-        try:
-            council_input = float(self.council_entry.get() or 0)
-            values['council'] = int(council_input * 1000)
-        except (ValueError, TypeError):
-            raise ValueError("Council must be numeric (K).")
-        
-        try:
-            values['days'] = int(self.days_entry.get() or 0)
-            values['hours'] = int(self.hours_entry.get() or 0)
-            values['minutes'] = int(self.minutes_entry.get() or 0)
-        except (ValueError, TypeError):
-            raise ValueError("Days, Hours, Minutes must be integers.")
-        
-        override_flag = self.max_time_override_var.get()
-        total_minutes = values['days'] * 24 * 60 + values['hours'] * 60 + values['minutes']
-        if total_minutes > MAX_TOTAL_MINUTES and not override_flag:
-            raise ValueError(f"Reset time cannot exceed {MAX_DAYS}d {MAX_HOURS}h {MAX_MINUTES}m unless Max-Time-Override is checked.")
-        
-        values['override_max_time'] = override_flag
-        values['muted'] = self.muted_var.get()
-        
-        selected_cats = [c for c, var in self.cat_vars.items() if var.get()]
-        if self.custom_var.get():
-            cv = self.custom_entry.get().strip()
-            if cv:
-                extras = [x.strip() for x in cv.split(",") if x.strip()]
-                selected_cats.extend(extras)
-        
-        seen = set()
-        final_cats = []
-        for c in selected_cats:
-            if c not in seen:
-                seen.add(c)
-                final_cats.append(c)
-        
-        values['categories'] = final_cats
-        
-        return values
+@dataclass
+class DamageEvent:
+    player_name: str; health_dmg: int; armor_dmg: int; aggro_percent: float
+    npc_id: int; npc_name: str; zone_name: str; timestamp: datetime
+    character_name: str; zone_id: Optional[int] = None
 
+@dataclass
+class ZoneInfo:
+    name: str; entered_time: datetime; character_name: str
 
-class VendorCard:
-    """Display card for a single vendor."""
-    
-    def __init__(self, parent: tk.Frame, vendor: Vendor, 
-                 min_time: float, max_time: float,
-                 callbacks: Dict):
-        self.parent = parent
-        self.vendor = vendor
-        self.callbacks = callbacks
-        
-        self.outer_frame = None
-        self.time_label = None
-        self.widgets_for_pulse = []
-        
-        self._create_card(min_time, max_time)
-    
-    def _create_card(self, min_time: float, max_time: float):
-        """Create the vendor card UI."""
-        border_color = calculate_border_color(self.vendor, min_time, max_time)
-        bg_color = COLOR_EMPTY_BG if (self.vendor.is_empty and not self.vendor.is_ready_to_reset) else COLOR_NORMAL_BG
-        
-        self.outer_frame = tk.Frame(self.parent, bg=border_color)
-        self.outer_frame.pack(fill=tk.X, padx=4, pady=4)
-        self.outer_frame.vendor_name = self.vendor.name
-        
-        vf = tk.Frame(self.outer_frame, bg=bg_color)
-        vf.pack(padx=2, pady=2, fill=tk.X)
-        
-        info = tk.Frame(vf, bg=bg_color)
-        info.pack(fill=tk.X, padx=4, pady=2)
-        
-        left_info = tk.Frame(info, bg=bg_color)
-        left_info.pack(side=tk.LEFT, anchor="w")
-        
-        name_label = Label(left_info, 
-                           text=f"{self.vendor.name} ({self.vendor.zone})", 
-                           bg=bg_color, font=("Arial", 10, "bold"))
-        name_label.pack(anchor="w")
-        
-        council_str = f"Council: {format_number(self.vendor.council_left)}"
-        if self.vendor.reset_maximum > 0:
-            council_str += f" / Max: {format_number(self.vendor.reset_maximum)}"
-        council_label = Label(left_info, text=council_str, bg=bg_color)
-        council_label.pack(anchor="w")
-        
-        time_str = self._get_time_string()
-        self.time_label = Label(info, text=time_str, bg=bg_color)
-        self.time_label.pack(side=tk.RIGHT, anchor="e")
-        self.outer_frame.time_label = self.time_label
-        
-        btns = tk.Frame(vf, bg=bg_color)
-        btns.pack(fill=tk.X, padx=4, pady=2)
-        
-        Button(btns, text="Update", 
-               command=lambda: self.callbacks['update'](self.vendor)).pack(side=tk.LEFT, padx=5, pady=2)
-        Button(btns, text="Delete", 
-               command=lambda: self.callbacks['delete'](self.vendor), 
-               fg="red").pack(side=tk.LEFT, padx=5, pady=2)
-        
-        mute_text = "Unmute" if self.vendor.muted else "Mute"
-        Button(btns, text=mute_text, 
-               command=lambda: self.callbacks['toggle_mute'](self.vendor)).pack(side=tk.LEFT, padx=5, pady=2)
-        
-        if self.vendor.is_empty and self.vendor.is_ready_to_reset and not self.vendor.muted:
-            self.widgets_for_pulse = [vf, info, left_info, name_label, council_label, self.time_label, btns]
-    
-    def _get_time_string(self) -> str:
-        """Get formatted time string."""
-        time_obj = self.vendor.time_until_reset
-        if time_obj.days >= 0 and time_obj.hours >= 0 and time_obj.minutes >= 0:
-            return time_obj.to_string()
-        else:
-            return "RESET PENDING!"
-
-
-# ---------------------
-# Transaction Window
-# ---------------------
-class TransactionWindow:
-    """Window for viewing transaction history."""
-    
-    def __init__(self, parent, db: VendorDatabase, character_name: str):
-        self.parent = parent
-        self.db = db
-        self.character_name = character_name
-        
-        self.window = Toplevel(parent)
-        self.window.title("Transaction History")
-        self.window.geometry("800x600")
-        
-        self.days_var = StringVar(value="7")
-        self.trans_frame = None
-        self.daily_frame = None
-        
-        self._create_ui()
-        self.refresh_transactions()
-    
-    def _create_ui(self):
-        """Create the transaction window UI."""
-        controls = tk.Frame(self.window)
-        controls.pack(fill=tk.X, padx=10, pady=10)
-        
-        Label(controls, text="Days to show:").pack(side=tk.LEFT, padx=5)
-        days_entry = Entry(controls, textvariable=self.days_var, width=5)
-        days_entry.pack(side=tk.LEFT, padx=5)
-        Button(controls, text="Refresh", command=self.refresh_transactions).pack(side=tk.LEFT, padx=5)
-        
-        notebook = ttk.Notebook(self.window)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        trans_tab = ScrollableFrame(notebook)
-        notebook.add(trans_tab, text="Transaction List")
-        self.trans_frame = trans_tab.scrollable_frame
-        
-        daily_tab = ScrollableFrame(notebook)
-        notebook.add(daily_tab, text="Daily Earnings")
-        self.daily_frame = daily_tab.scrollable_frame
-    
-    def refresh_transactions(self):
-        """Refresh transaction displays."""
-        try:
-            days = int(self.days_var.get())
-            start_date = datetime.now() - timedelta(days=days)
-            transactions = self.db.get_transactions(self.character_name, start_date=start_date)
-            
-            self._display_transaction_list(transactions)
-            self._display_daily_earnings(transactions, days)
-        except ValueError:
-            messagebox.showerror("Error", "Days must be a number", parent=self.window)
-    
-    def _display_transaction_list(self, transactions: List[Tuple]):
-        """Display transaction list."""
-        for widget in self.trans_frame.winfo_children():
-            widget.destroy()
-        
-        total_earned = 0
-        for trans in transactions:
-            # Updated to handle npc_id column
-            trans_id, char, vendor, npc_id, trans_type, before, after, change, timestamp, notes = trans
-            # Count negative changes as earned (sold to vendor), but exclude deletions
-            if change < 0 and trans_type != 'deletion':
-                total_earned += abs(change)
-            
-            color = "green" if change > 0 else "red" if change < 0 else "black"
-            dt = datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M")
-            
-            trans_text = f"{dt} | {vendor} | {trans_type.upper()} | {format_number(change)} council"
-            if notes:
-                trans_text += f" | {notes}"
-            
-            label = Label(self.trans_frame, text=trans_text, fg=color, anchor="w")
-            label.pack(fill=tk.X, padx=5, pady=2)
-        
-        summary = Label(self.trans_frame, 
-                          text=f"\nTotal Council Earned: {format_number(total_earned)}", 
-                          font=("Arial", 10, "bold"))
-        summary.pack(fill=tk.X, padx=5, pady=10)
-    
-    def _display_daily_earnings(self, transactions: List[Tuple], days: int):
-        """Display daily earnings grid."""
-        for widget in self.daily_frame.winfo_children():
-            widget.destroy()
-        
-        daily_earnings = defaultdict(int)
-        for trans in transactions:
-            trans_id, char, vendor, npc_id, trans_type, before, after, change, timestamp, notes = trans
-            # Exclude deletions from daily earnings
-            if change < 0 and trans_type != 'deletion':
-                dt = datetime.fromisoformat(timestamp)
-                date_key = dt.date()
-                daily_earnings[date_key] += abs(change)
-        
-        all_dates = [(datetime.now() - timedelta(days=i)).date() for i in range(days)]
-        
-        Label(self.daily_frame, text="Daily Council Earned", 
-              font=("Arial", 12, "bold")).grid(row=0, column=0, columnspan=2, padx=5, pady=10, sticky="w")
-        
-        Label(self.daily_frame, text="Date", font=("Arial", 10, "bold"), 
-              anchor="w", relief="solid", borderwidth=1, padx=5, pady=3).grid(row=1, column=0, sticky="ew")
-        Label(self.daily_frame, text="Council Earned", font=("Arial", 10, "bold"), 
-              anchor="e", relief="solid", borderwidth=1, padx=5, pady=3).grid(row=1, column=1, sticky="ew")
-        
-        total_daily = 0
-        row = 2
-        for date in all_dates:
-            earned = daily_earnings.get(date, 0)
-            total_daily += earned
-            
-            weekday = date.strftime("%A")
-            date_str = date.strftime("%Y-%m-%d")
-            color = "green" if earned > 0 else "gray"
-            date_text = f"{weekday}, {date_str}"
-            council_text = format_number(earned)
-            
-            Label(self.daily_frame, text=date_text, fg=color, anchor="w", 
-                  font=("Arial", 10), relief="solid", borderwidth=1, padx=5, pady=3).grid(row=row, column=0, sticky="ew")
-            Label(self.daily_frame, text=council_text, fg=color, anchor="e", 
-                  font=("Arial", 10), relief="solid", borderwidth=1, padx=5, pady=3).grid(row=row, column=1, sticky="ew")
-            row += 1
-        
-        Label(self.daily_frame, text="Total:", font=("Arial", 10, "bold"), 
-              anchor="w", relief="solid", borderwidth=1, padx=5, pady=3).grid(row=row, column=0, sticky="ew")
-        Label(self.daily_frame, text=f"{format_number(total_daily)}", 
-              font=("Arial", 10, "bold"), anchor="e", relief="solid", borderwidth=1, padx=5, pady=3).grid(row=row, column=1, sticky="ew")
-
-
-# ---------------------
-# Scan Results Window
-# ---------------------
-class ScanResultsWindow:
-    """Window for displaying and selecting scan results."""
-    
-    def __init__(self, parent, scan_result: ScanResult, db: VendorDatabase, 
-                 current_character: str, on_import_callback):
-        self.parent = parent
-        self.scan_result = scan_result
-        self.db = db
-        self.current_character = current_character
-        self.on_import_callback = on_import_callback
-        
-        self.window = Toplevel(parent)
-        self.window.title("Scan Results")
-        self.window.geometry("900x600")
-        
-        self.char_var = StringVar()
-        self.vendor_vars = {}  # npc_id -> BooleanVar
-        
-        self._create_ui()
-    
-    def _create_ui(self):
-        """Create the scan results UI."""
-        # Top section - character selection
-        top_frame = tk.Frame(self.window)
-        top_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        Label(top_frame, text="Characters found in log:", font=("Arial", 10, "bold")).pack(anchor="w")
-        
-        chars_found = sorted(self.scan_result.characters_found)
-        if not chars_found:
-            Label(top_frame, text="No characters found in log file.", fg="red").pack(anchor="w")
-            return
-        
-        # Character selector
-        char_frame = tk.Frame(top_frame)
-        char_frame.pack(fill=tk.X, pady=5)
-        Label(char_frame, text="Import data for character:").pack(side=tk.LEFT)
-        
-        # Default to current character if found, otherwise first found
-        default_char = self.current_character if self.current_character in chars_found else chars_found[0]
-        self.char_var.set(default_char)
-        
-        char_menu = OptionMenu(char_frame, self.char_var, *chars_found, command=self._on_char_select)
-        char_menu.pack(side=tk.LEFT, padx=5)
-        
-        # Stats
-        stats_text = f"Found {len(self.scan_result.npc_mappings)} NPCs, {len(chars_found)} characters"
-        Label(top_frame, text=stats_text, fg="gray").pack(anchor="w")
-        
-        # Vendor list
-        Label(self.window, text="Vendors with data:", font=("Arial", 10, "bold")).pack(padx=10, anchor="w")
-        
-        list_frame = ScrollableFrame(self.window)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        self.vendor_list_frame = list_frame.scrollable_frame
-        
-        self._populate_vendor_list()
-        
-        # Buttons
-        btn_frame = tk.Frame(self.window)
-        btn_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        Button(btn_frame, text="Select All", command=self._select_all).pack(side=tk.LEFT, padx=5)
-        Button(btn_frame, text="Deselect All", command=self._deselect_all).pack(side=tk.LEFT, padx=5)
-        Button(btn_frame, text="Import Selected", command=self._import_selected, 
-               bg="green", fg="white").pack(side=tk.RIGHT, padx=5)
-        Button(btn_frame, text="Cancel", command=self.window.destroy).pack(side=tk.RIGHT, padx=5)
-        
-        # Errors section
-        if self.scan_result.errors:
-            error_frame = tk.Frame(self.window)
-            error_frame.pack(fill=tk.X, padx=10, pady=5)
-            Label(error_frame, text=f"Warnings ({len(self.scan_result.errors)}):", fg="orange").pack(anchor="w")
-            error_text = "; ".join(self.scan_result.errors[:5])
-            if len(self.scan_result.errors) > 5:
-                error_text += f"... and {len(self.scan_result.errors) - 5} more"
-            Label(error_frame, text=error_text, fg="gray", wraplength=850).pack(anchor="w")
-    
-    def _populate_vendor_list(self):
-        """Populate the vendor list for selected character."""
-        for widget in self.vendor_list_frame.winfo_children():
-            widget.destroy()
-        self.vendor_vars.clear()
-        
-        char = self.char_var.get()
-        if char not in self.scan_result.vendor_data:
-            Label(self.vendor_list_frame, text="No vendor data for this character.").pack(anchor="w")
-            return
-        
-        vendor_data = self.scan_result.vendor_data[char]
-        
-        # Sort by NPC name
-        sorted_vendors = []
-        for npc_id, (council_left, reset_ts_ms, max_council) in vendor_data.items():
-            npc_name = self.scan_result.npc_mappings.get(npc_id, f"Unknown_{npc_id}")
-            zone = self.scan_result.npc_zones.get(npc_id, "Unknown")
-            sorted_vendors.append((npc_name, npc_id, council_left, reset_ts_ms, max_council, zone))
-        sorted_vendors.sort(key=lambda x: x[0])
-        
-        for npc_name, npc_id, council_left, reset_ts_ms, max_council, zone in sorted_vendors:
-            row_frame = tk.Frame(self.vendor_list_frame)
-            row_frame.pack(fill=tk.X, pady=2)
-            
-            var = BooleanVar(value=True)
-            self.vendor_vars[npc_id] = var
-            
-            cb = Checkbutton(row_frame, variable=var)
-            cb.pack(side=tk.LEFT)
-            
-            # Vendor info with zone
-            info_text = f"{npc_name} ({zone})"
-            Label(row_frame, text=info_text, font=("Arial", 10, "bold"), width=30, anchor="w").pack(side=tk.LEFT)
-            
-            council_text = f"Council: {format_number(council_left)} / {format_number(max_council)}"
-            Label(row_frame, text=council_text, width=20, anchor="w").pack(side=tk.LEFT)
-            
-            reset_text = format_reset_countdown(reset_ts_ms)
-            Label(row_frame, text=reset_text, fg="blue", width=25, anchor="w").pack(side=tk.LEFT)
-    
-    def _on_char_select(self, *args):
-        """Handle character selection change."""
-        self._populate_vendor_list()
-    
-    def _select_all(self):
-        """Select all vendors."""
-        for var in self.vendor_vars.values():
-            var.set(True)
-    
-    def _deselect_all(self):
-        """Deselect all vendors."""
-        for var in self.vendor_vars.values():
-            var.set(False)
-    
-    def _import_selected(self):
-        """Import selected vendors."""
-        char = self.char_var.get()
-        selected_ids = [npc_id for npc_id, var in self.vendor_vars.items() if var.get()]
-        
-        if not selected_ids:
-            messagebox.showwarning("No Selection", "Please select at least one vendor to import.", parent=self.window)
-            return
-        
-        # Save NPC mappings and zones first
-        for npc_id, npc_name in self.scan_result.npc_mappings.items():
-            zone = self.scan_result.npc_zones.get(npc_id, '')
-            self.db.save_npc_mapping(npc_id, npc_name, zone)
-        
-        # Import vendor data
-        imported = 0
-        updated = 0
-        
-        for npc_id in selected_ids:
-            if npc_id not in self.scan_result.vendor_data.get(char, {}):
-                continue
-            
-            council_left, reset_ts_ms, max_council = self.scan_result.vendor_data[char][npc_id]
-            npc_name = self.scan_result.npc_mappings.get(npc_id, f"Unknown_{npc_id}")
-            zone = self.scan_result.npc_zones.get(npc_id, self.db.get_npc_zone(npc_id))
-            
-            # Check if vendor exists
-            existing = self.db.get_vendor_by_npc_id(char, npc_id)
-            
-            if existing:
-                # Update existing vendor
-                old_council = existing.council_left
-                
-                # Calculate last reset from timestamp
-                if reset_ts_ms == 0:
-                    existing.last_reset = datetime.now()
-                else:
-                    reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
-                    existing.last_reset = reset_time - timedelta(days=7)
-                
-                existing.council_left = council_left
-                if max_council > existing.reset_maximum:
-                    existing.reset_maximum = max_council
-                
-                # Update zone if we have new zone data
-                if zone and zone != 'Unknown':
-                    existing.zone = zone
-                
-                # Log transaction if council changed
-                if old_council != council_left:
-                    self.db.log_transaction(
-                        char, npc_name, 'scan_update',
-                        old_council, council_left,
-                        f"Auto-scan update: {format_number(old_council)} → {format_number(council_left)}",
-                        npc_id
-                    )
-                
-                updated += 1
-            else:
-                # Create new vendor
-                imported += 1
-        
-        # Trigger callback to refresh
-        self.on_import_callback(char, selected_ids, self.scan_result)
-        
-        messagebox.showinfo(
-            "Import Complete", 
-            f"Imported {imported} new vendors, updated {updated} existing vendors for {char}.",
-            parent=self.window
-        )
-        self.window.destroy()
-
-
-# ---------------------
-# Settings Window
-# ---------------------
-class SettingsWindow:
-    """Window for application settings."""
-    
-    def __init__(self, parent, settings: SettingsManager, on_save_callback):
-        self.parent = parent
-        self.settings = settings
-        self.on_save_callback = on_save_callback
-        
-        self.window = Toplevel(parent)
-        self.window.title("Settings")
-        self.window.geometry("600x200")
-        
-        self.log_path_var = StringVar(value=settings.get('log_path', DEFAULT_LOG_PATH))
-        
-        self._create_ui()
-    
-    def _create_ui(self):
-        """Create settings UI."""
-        # Log path
-        path_frame = tk.Frame(self.window)
-        path_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        Label(path_frame, text="Player.log Path:", font=("Arial", 10, "bold")).pack(anchor="w")
-        
-        entry_frame = tk.Frame(path_frame)
-        entry_frame.pack(fill=tk.X, pady=5)
-        
-        path_entry = Entry(entry_frame, textvariable=self.log_path_var, width=60)
-        path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        Button(entry_frame, text="Browse...", command=self._browse_path).pack(side=tk.LEFT, padx=5)
-        
-        Label(path_frame, text="Default: " + DEFAULT_LOG_PATH, fg="gray", wraplength=550).pack(anchor="w")
-        
-        # Buttons
-        btn_frame = tk.Frame(self.window)
-        btn_frame.pack(fill=tk.X, padx=10, pady=20)
-        
-        Button(btn_frame, text="Save", command=self._save, bg="green", fg="white").pack(side=tk.RIGHT, padx=5)
-        Button(btn_frame, text="Cancel", command=self.window.destroy).pack(side=tk.RIGHT, padx=5)
-        Button(btn_frame, text="Reset to Default", command=self._reset_default).pack(side=tk.LEFT, padx=5)
-    
-    def _browse_path(self):
-        """Open file browser for log path."""
-        initial_dir = os.path.dirname(self.log_path_var.get())
-        if not os.path.exists(initial_dir):
-            initial_dir = os.path.expanduser("~")
-        
-        path = filedialog.askopenfilename(
-            parent=self.window,
-            title="Select Player.log",
-            initialdir=initial_dir,
-            filetypes=[("Log files", "*.log"), ("All files", "*.*")]
-        )
-        
-        if path:
-            self.log_path_var.set(path)
-    
-    def _reset_default(self):
-        """Reset to default path."""
-        self.log_path_var.set(DEFAULT_LOG_PATH)
-    
-    def _save(self):
-        """Save settings."""
-        self.settings.set('log_path', self.log_path_var.get())
-        self.on_save_callback()
-        messagebox.showinfo("Settings Saved", "Settings have been saved.", parent=self.window)
-        self.window.destroy()
-
-
-# ---------------------
-# Main Application
-# ---------------------
-class VendorApp(tk.Tk):
-    """Main application window."""
-    
+class PandasDataStore:
     def __init__(self):
-        super().__init__()
-        self.title("Vendor Reset Manager (Auto-Scan)")
-        self.geometry("600x650")
-        
-        # Initialize settings and database
-        self.settings = SettingsManager(SETTINGS_FILE)
-        self.db = VendorDatabase(DATABASE_PATH)
-        
-        # State
-        self.vendors = []
-        self.characters = self.db.get_all_characters()
-        self.current_character = self.characters[0] if self.characters else DEFAULT_CHARACTER
-        self.vendors = self.db.load_vendors(self.current_character)
-        
-        # Animation state
-        self.pulse_frame = 0
-        self.pulse_widgets = []
-        self.flash_phase = False
-        self.timer_running = True
-        
-        # Auto-scan state
-        self.auto_scan_enabled = False
-        self.log_watcher: Optional[LogWatcher] = None
-        self.auto_scan_status_label = None
-        self.auto_scan_btn = None
-        self.last_update_time = None
-        
-        # UI elements
-        self.char_var = None
-        self.char_menu = None
-        self.filter_var = None
-        self.show_muted_var = None
-        self.scrollable_frame = None
-        self.total_council_label = None
-        self.total_max_label = None
-        self.earned_7d_label = None
-        
-        self._create_ui()
-        self._start_animations()
-        self._init_auto_scan()
-        
-        self.protocol("WM_DELETE_WINDOW", self.on_closing)
-    
-    def _create_ui(self):
-        """Create the main UI."""
-        self._create_top_bar()
-        self._create_search_bar()
-        self._create_info_bar()
-        self._create_button_bar()
-        self._create_vendor_list()
-        
-        self.update_vendor_list()
-        self.update_total_values()
-    
-    def _create_search_bar(self):
-        """Create search/filter bar on its own line."""
-        search_frame = tk.Frame(self)
-        search_frame.pack(fill=tk.X, padx=8, pady=4)
-        
-        Label(search_frame, text="Search:", font=("Arial", 10)).pack(side=tk.LEFT)
-        self.filter_var = StringVar()
-        self.filter_var.trace_add("write", lambda *a: self.update_vendor_list())
-        filter_entry = Entry(search_frame, textvariable=self.filter_var, font=("Arial", 11))
-        filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        # Multiple bindings to ensure filter updates reliably
-        filter_entry.bind("<KeyRelease>", lambda e: self.update_vendor_list())
-        filter_entry.bind("<Key>", lambda e: self.after(10, self.update_vendor_list))
-    
-    def _create_top_bar(self):
-        """Create top bar with character selection."""
-        top = tk.Frame(self)
-        top.pack(fill=tk.X, padx=8, pady=6)
-        
-        Label(top, text="Character:").pack(side=tk.LEFT)
-        self.char_var = StringVar(value=self.current_character)
-        self.char_var.trace_add("write", self._on_char_change)
-        self.char_menu = OptionMenu(top, self.char_var, *self.characters)
-        self.char_menu.pack(side=tk.LEFT, padx=6)
-        
-        Button(top, text="View Transactions", command=self._open_transactions_window).pack(side=tk.LEFT, padx=6)
-        
-        self.show_muted_var = BooleanVar(value=False)
-        self.show_muted_var.trace_add("write", lambda *a: self.update_vendor_list())
-        Checkbutton(top, text="Show Muted", variable=self.show_muted_var).pack(side=tk.LEFT, padx=6)
-    
-    def _create_info_bar(self):
-        """Create info bar with totals."""
-        info = tk.Frame(self, bg="lightgrey", relief="raised", bd=1)
-        info.pack(fill=tk.X, padx=8, pady=6)
-        
-        self.total_council_label = Label(info, text="Current Vendor Council Pool: 0K", bg="lightgrey")
-        self.total_council_label.pack(side=tk.LEFT, padx=8, pady=6)
-        
-        self.total_max_label = Label(info, text="Total Vendor Cash: 0K", bg="lightgrey")
-        self.total_max_label.pack(side=tk.LEFT, padx=8, pady=6)
-        
-        self.earned_7d_label = Label(info, text="Council earned (7d): 0K", bg="lightgrey")
-        self.earned_7d_label.pack(side=tk.LEFT, padx=8, pady=6)
-    
-    def _create_button_bar(self):
-        """Create button bar."""
-        btns = tk.Frame(self)
-        btns.pack(fill=tk.X, padx=8, pady=4)
-        
-        Button(btns, text="Add New Vendor", command=self._open_add_vendor_window).pack(side=tk.LEFT, padx=4)
-        
-        # Auto-scan toggle button
-        self.auto_scan_btn = Button(btns, text="▶ Start Auto-Scan", command=self._toggle_auto_scan,
-                                    bg="#28a745", fg="white", font=("Arial", 10, "bold"))
-        self.auto_scan_btn.pack(side=tk.LEFT, padx=10)
-        
-        # Auto-scan status label
-        self.auto_scan_status_label = Label(btns, text="Auto-scan: OFF", fg="gray")
-        self.auto_scan_status_label.pack(side=tk.LEFT, padx=4)
-        
-        # Settings button
-        Button(btns, text="⚙ Settings", command=self._open_settings_window).pack(side=tk.RIGHT, padx=4)
-    
-    def _init_auto_scan(self):
-        """Initialize the auto-scan system."""
-        log_path = self.settings.get('log_path', DEFAULT_LOG_PATH)
-        self.log_watcher = LogWatcher(log_path, self._on_auto_scan_update)
-        
-        # Do an initial scan to populate the watcher's state
-        if os.path.exists(log_path):
-            self.log_watcher.check_for_updates()
-    
-    def _toggle_auto_scan(self):
-        """Toggle auto-scan on/off."""
-        self.auto_scan_enabled = not self.auto_scan_enabled
-        
-        if self.auto_scan_enabled:
-            # Check if log file exists
-            log_path = self.settings.get('log_path', DEFAULT_LOG_PATH)
-            if not os.path.exists(log_path):
-                messagebox.showwarning(
-                    "Log File Not Found",
-                    f"Cannot start auto-scan.\nPlayer.log not found at:\n{log_path}\n\nPlease check Settings.",
-                    parent=self
-                )
-                self.auto_scan_enabled = False
-                return
-            
-            # Reinitialize watcher with current path (starts from beginning)
-            self.log_watcher = LogWatcher(log_path, self._on_auto_scan_update)
-            
-            # Update UI to show scanning
-            self.auto_scan_btn.config(text="⏹ Stop Auto-Scan", bg="#dc3545")
-            self.auto_scan_status_label.config(text="Scanning...", fg="blue")
-            self.update()
-            
-            # Do initial full scan and import everything
-            self.log_watcher.check_for_updates()
-            self._import_all_from_watcher()
-            
-            self.auto_scan_status_label.config(text="Auto-scan: ACTIVE", fg="green")
-            self._auto_scan_tick()
-        else:
-            self.auto_scan_btn.config(text="▶ Start Auto-Scan", bg="#28a745")
-            self.auto_scan_status_label.config(text="Auto-scan: OFF", fg="gray")
-    
-    def _import_all_from_watcher(self):
-        """Import all data from the watcher (full import on start)."""
-        if not self.log_watcher:
-            return
-        
-        scan_result = self.log_watcher.get_scan_result()
-        
-        if not scan_result.characters_found:
-            return
-        
-        # Import all NPC mappings and zones
-        for npc_id, npc_name in scan_result.npc_mappings.items():
-            zone = scan_result.npc_zones.get(npc_id, 'Unknown')
-            self.db.save_npc_mapping(npc_id, npc_name, zone)
-        
-        # Import vendor data for all characters
-        for character in scan_result.characters_found:
-            if character not in self.characters:
-                self.characters.append(character)
-            
-            if character not in scan_result.vendor_data:
-                continue
-            
-            char_vendors = self.db.load_vendors(character)
-            # Create lookup by name+zone (the canonical identifier)
-            existing_by_name_zone = {(v.name, v.zone): v for v in char_vendors}
-            
-            for npc_id, (council_left, reset_ts_ms, max_council) in scan_result.vendor_data[character].items():
-                npc_name = scan_result.npc_mappings.get(npc_id, f"Unknown_{npc_id}")
-                zone = scan_result.npc_zones.get(npc_id, 'Unknown')
-                
-                # VendorFox is special - always use 'Anywhere' as zone
-                if npc_name == 'VendorFox':
-                    zone = 'Anywhere'
-                
-                # Look up by name+zone (canonical identifier)
-                key = (npc_name, zone)
-                
-                if key in existing_by_name_zone:
-                    # Update existing vendor
-                    vendor = existing_by_name_zone[key]
-                    old_council = vendor.council_left
-                    
-                    if reset_ts_ms == 0:
-                        vendor.last_reset = datetime.now()
-                    else:
-                        reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
-                        vendor.last_reset = reset_time - timedelta(days=7)
-                    
-                    vendor.council_left = council_left
-                    vendor.npc_id = npc_id  # Update to latest NPC ID
-                    if max_council > vendor.reset_maximum:
-                        vendor.reset_maximum = max_council
-                    
-                    if old_council != council_left:
-                        self.db.log_transaction(
-                            character, npc_name, 'auto_scan',
-                            old_council, council_left,
-                            f"Auto-scan: {format_number(old_council)} → {format_number(council_left)}",
-                            npc_id
-                        )
-                else:
-                    # Create new vendor
-                    new_vendor = Vendor.from_scan_data(
-                        npc_id, npc_name, zone,
-                        council_left, reset_ts_ms, max_council
-                    )
-                    char_vendors.append(new_vendor)
-                    existing_by_name_zone[key] = new_vendor  # Track by name+zone
-                    
-                    self.db.log_transaction(
-                        character, npc_name, 'creation',
-                        0, council_left,
-                        f"Auto-scan import: {format_number(council_left)} council",
-                        npc_id
-                    )
-            
-            self.db.save_vendors(char_vendors, character)
-        
-        # Update character menu and refresh UI
-        self.characters.sort()
-        self._update_char_menu()
-        self.vendors = self.db.load_vendors(self.current_character)
-        self.update_vendor_list()
-        self.update_total_values()
-    
-    def _auto_scan_tick(self):
-        """Periodic check for new log data."""
-        if not self.auto_scan_enabled or not self.timer_running:
-            return
-        
-        try:
-            if self.log_watcher and self.log_watcher.check_for_updates():
-                self._apply_watcher_updates()
-        except Exception as e:
-            print(f"Auto-scan error: {e}")
-        
-        # Schedule next tick
-        self.after(AUTO_SCAN_INTERVAL_MS, self._auto_scan_tick)
-    
-    def _apply_watcher_updates(self):
-        """Apply updates from the log watcher to the database and UI."""
-        if not self.log_watcher:
-            return
-        
-        updates = self.log_watcher.last_scan_updates
-        if not updates:
-            return
-        
-        # Get current data from watcher
-        scan_result = self.log_watcher.get_scan_result()
-        
-        # Track which characters were updated
-        updated_characters = set()
-        
-        for character, npc_id, npc_name in updates:
-            updated_characters.add(character)
-            
-            # Ensure character exists in our list
-            if character not in self.characters:
-                self.characters.append(character)
-                self.characters.sort()
-                self._update_char_menu()
-            
-            # Save NPC mapping and zone
-            zone = scan_result.npc_zones.get(npc_id, 'Unknown')
-            self.db.save_npc_mapping(npc_id, npc_name, zone)
-            
-            # Get vendor data
-            if character in scan_result.vendor_data and npc_id in scan_result.vendor_data[character]:
-                council_left, reset_ts_ms, max_council = scan_result.vendor_data[character][npc_id]
-                
-                # Load vendors for this character
-                char_vendors = self.db.load_vendors(character)
-                
-                # VendorFox is special - always use 'Anywhere' as zone
-                if npc_name == 'VendorFox':
-                    zone = 'Anywhere'
-                
-                # Look up by name+zone (canonical identifier)
-                existing = next((v for v in char_vendors if v.name == npc_name and v.zone == zone), None)
-                
-                if existing:
-                    # Update existing vendor
-                    old_council = existing.council_left
-                    
-                    if reset_ts_ms == 0:
-                        existing.last_reset = datetime.now()
-                    else:
-                        reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
-                        existing.last_reset = reset_time - timedelta(days=7)
-                    
-                    existing.council_left = council_left
-                    existing.npc_id = npc_id  # Update to latest NPC ID
-                    if max_council > existing.reset_maximum:
-                        existing.reset_maximum = max_council
-                    # Note: zone is part of the vendor's identity now, don't update it
-                    
-                    # Log transaction if council changed
-                    if old_council != council_left:
-                        self.db.log_transaction(
-                            character, npc_name, 'auto_scan',
-                            old_council, council_left,
-                            f"Auto-scan: {format_number(old_council)} → {format_number(council_left)}",
-                            npc_id
-                        )
-                else:
-                    # Create new vendor
-                    new_vendor = Vendor.from_scan_data(
-                        npc_id, npc_name, zone,
-                        council_left, reset_ts_ms, max_council
-                    )
-                    char_vendors.append(new_vendor)
-                    
-                    self.db.log_transaction(
-                        character, npc_name, 'creation',
-                        0, council_left,
-                        f"Auto-scan import: {format_number(council_left)} council",
-                        npc_id
-                    )
-                
-                # Save vendors for this character
-                self.db.save_vendors(char_vendors, character)
-        
-        # Update UI if current character was affected
-        if self.current_character in updated_characters:
-            self.vendors = self.db.load_vendors(self.current_character)
-            self.update_vendor_list()
-            self.update_total_values()
-        
-        # Update status with last update time
-        self.last_update_time = datetime.now()
-        update_names = [name for _, _, name in updates]
-        status_text = f"Auto-scan: Updated {', '.join(update_names[:3])}"
-        if len(update_names) > 3:
-            status_text += f" +{len(update_names)-3} more"
-        status_text += f" ({self.last_update_time.strftime('%H:%M:%S')})"
-        self.auto_scan_status_label.config(text=status_text, fg="green")
-    
-    def _on_auto_scan_update(self, character: str, npc_id: int, npc_name: str):
-        """Callback when auto-scan finds new data (not currently used, updates batched)."""
-        pass
-    
-    def _create_vendor_list(self):
-        """Create scrollable vendor list."""
-        vendor_frame = ScrollableFrame(self)
-        vendor_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self.scrollable_frame = vendor_frame.scrollable_frame
-    
-    def _start_animations(self):
-        """Start animation timers."""
-        self.after(TIMER_UPDATE_MS, self._update_timers)
-        self.after(PULSE_UPDATE_MS, self._update_pulse_animation)
-    
-    def _on_char_change(self, *args):
-        """Handle character change."""
-        try:
-            self.current_character = self.char_var.get()
-            self.vendors = self.db.load_vendors(self.current_character)
-            self.update_vendor_list()
-            self.update_total_values()
-        except Exception as e:
-            self._show_error(f"Could not switch to character: {e}")
-    
-    def _add_new_character(self):
-        """Add a new character."""
-        name = simpledialog.askstring("New Character", "Enter new character name:", parent=self)
-        if not name or not name.strip():
-            return
-        
-        safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
-        if not safe_name:
-            self._show_error("Character name must contain alphanumeric characters.")
-            return
-        
-        if safe_name in self.characters:
-            self._show_error("Character already exists.")
-            return
-        
-        self.characters.append(safe_name)
-        self.characters.sort()
-        self.char_var.set(safe_name)
-        self._update_char_menu()
-    
-    def _update_char_menu(self):
-        """Update character menu."""
-        try:
-            menu = self.char_menu["menu"]
-            menu.delete(0, "end")
-            for c in sorted(self.characters):
-                menu.add_command(label=c, command=tk._setit(self.char_var, c))
-        except Exception as e:
-            print(f"Error updating character menu: {e}")
-    
-    def _open_transactions_window(self):
-        """Open transaction history window."""
-        TransactionWindow(self, self.db, self.current_character)
-    
-    def _open_settings_window(self):
-        """Open settings window."""
-        SettingsWindow(self, self.settings, lambda: None)
-    
-    def _scan_player_log(self):
-        """Scan Player.log file for vendor data."""
-        log_path = self.settings.get('log_path', DEFAULT_LOG_PATH)
-        
-        if not os.path.exists(log_path):
-            response = messagebox.askyesno(
-                "Log File Not Found",
-                f"Player.log not found at:\n{log_path}\n\nWould you like to browse for it?",
-                parent=self
-            )
-            if response:
-                path = filedialog.askopenfilename(
-                    parent=self,
-                    title="Select Player.log",
-                    filetypes=[("Log files", "*.log"), ("All files", "*.*")]
-                )
-                if path:
-                    self.settings.set('log_path', path)
-                    log_path = path
-                else:
-                    return
+        self._lock = threading.RLock()
+        self._players_list, self._zones_list, self._events_list, self._wisdom_list = [], [], [], []
+        self._players_df_cache = self._zones_df_cache = self._events_df_cache = None
+        self._player_name_to_id, self._player_id_to_info = {}, {}
+        self._zone_id_to_info, self._zone_key_to_id = {}, {}
+        self._aliases = load_aliases()
+        self._next_player_id = self._next_zone_id = self._next_event_id = 1
+
+    def _invalidate_cache(self, which='all'):
+        if which in ('all', 'players'): self._players_df_cache = None
+        if which in ('all', 'zones'): self._zones_df_cache = None
+        if which in ('all', 'events'): self._events_df_cache = None
+
+    def _get_events_df(self) -> pd.DataFrame:
+        if self._events_df_cache is None:
+            if self._events_list:
+                self._events_df_cache = pd.DataFrame(self._events_list)
+                if 'timestamp' in self._events_df_cache.columns:
+                    self._events_df_cache['timestamp'] = pd.to_datetime(self._events_df_cache['timestamp'])
             else:
-                return
-        
-        # Show scanning message
-        self.config(cursor="wait")
-        self.update()
-        
-        try:
-            scanner = PlayerLogScanner(log_path)
-            result = scanner.scan()
+                self._events_df_cache = pd.DataFrame(columns=['event_id','zone_id','npc_id','npc_name','player_id','health_dmg','armor_dmg','aggro_percent','timestamp','character_name'])
+        return self._events_df_cache
+
+    def get_or_create_player(self, name: str) -> int:
+        with self._lock:
+            if name in self._player_name_to_id: return self._player_name_to_id[name]
+            pid = self._next_player_id; self._next_player_id += 1
+            alias = self._aliases.get(name)
+            self._players_list.append({'player_id': pid, 'original_name': name, 'alias': alias})
+            self._player_name_to_id[name] = pid
+            self._player_id_to_info[pid] = {'name': name, 'alias': alias}
+            self._invalidate_cache('players')
+            return pid
+
+    def get_or_create_players_batch(self, names: Set[str]) -> Dict[str, int]:
+        result = {}
+        with self._lock:
+            for name in names:
+                if name in self._player_name_to_id: result[name] = self._player_name_to_id[name]
+                else:
+                    pid = self._next_player_id; self._next_player_id += 1
+                    alias = self._aliases.get(name)
+                    self._players_list.append({'player_id': pid, 'original_name': name, 'alias': alias})
+                    self._player_name_to_id[name] = pid
+                    self._player_id_to_info[pid] = {'name': name, 'alias': alias}
+                    result[name] = pid
+            if result: self._invalidate_cache('players')
+        return result
+
+    def update_player_alias(self, player_id: int, alias: str):
+        with self._lock:
+            if player_id not in self._player_id_to_info: return
+            info = self._player_id_to_info[player_id]
+            info['alias'] = alias if alias else None
+            for p in self._players_list:
+                if p['player_id'] == player_id: p['alias'] = alias if alias else None; break
+            if alias: self._aliases[info['name']] = alias
+            elif info['name'] in self._aliases: del self._aliases[info['name']]
+            save_aliases(self._aliases)
+            self._invalidate_cache('players')
+
+    def get_all_players(self, filter_text: str = None) -> List[Tuple[int, str, str]]:
+        with self._lock:
+            if not self._events_list: return []
+            events_df = self._get_events_df()
+            mask = (events_df['health_dmg'] > 0) | (events_df['armor_dmg'] > 0)
+            active_ids = set(events_df.loc[mask, 'player_id'].unique())
+            results = []
+            for pid in active_ids:
+                if pid in self._player_id_to_info:
+                    info = self._player_id_to_info[pid]
+                    if filter_text and filter_text.lower() not in info['name'].lower(): continue
+                    results.append((pid, info['name'], info['alias']))
+            return sorted(results, key=lambda x: x[1])
+
+    def _get_display_name(self, pid: int) -> str:
+        info = self._player_id_to_info.get(pid)
+        return (info['alias'] or info['name']) if info else "Unknown"
+
+    def create_zone_entry(self, name: str, char_name: str, entered_time: datetime, log_date: str = None) -> Optional[int]:
+        with self._lock:
+            open_zone = None
+            for z in reversed(self._zones_list):
+                if z['character_name'] == char_name and z['left_time'] is None: open_zone = z; break
+            if open_zone and open_zone['name'] == name: return open_zone['zone_id']
+            if open_zone: open_zone['left_time'] = entered_time
+            zid = self._next_zone_id; self._next_zone_id += 1
+            zone_dict = {'zone_id': zid, 'name': name, 'character_name': char_name,
+                        'entered_time': entered_time, 'left_time': None, 'log_date': log_date}
+            self._zones_list.append(zone_dict)
+            self._zone_id_to_info[zid] = zone_dict
+            self._invalidate_cache('zones')
+            return zid
+
+    def get_current_zone_id(self, char_name: str) -> Optional[int]:
+        with self._lock:
+            for z in reversed(self._zones_list):
+                if z['character_name'] == char_name and z['left_time'] is None: return z['zone_id']
+            return None
+
+    def insert_damage_event(self, event: DamageEvent, zone_id: int) -> int:
+        if event.health_dmg == 0 and event.armor_dmg == 0: return -1
+        pid = self.get_or_create_player(event.player_name)
+        with self._lock:
+            eid = self._next_event_id; self._next_event_id += 1
+            self._events_list.append({'event_id': eid, 'zone_id': zone_id, 'npc_id': event.npc_id,
+                'npc_name': event.npc_name, 'player_id': pid, 'health_dmg': event.health_dmg,
+                'armor_dmg': event.armor_dmg, 'aggro_percent': event.aggro_percent,
+                'timestamp': event.timestamp, 'character_name': event.character_name})
+            self._invalidate_cache('events')
+            return eid
+
+    def insert_damage_events_batch(self, events: List[Tuple]) -> int:
+        if not events: return 0
+        with self._lock:
+            for e in events:
+                zid, npc_id, npc_name, pid, h_dmg, a_dmg, aggro, ts, char = e
+                eid = self._next_event_id; self._next_event_id += 1
+                self._events_list.append({'event_id': eid, 'zone_id': zid, 'npc_id': npc_id,
+                    'npc_name': npc_name, 'player_id': pid, 'health_dmg': h_dmg, 'armor_dmg': a_dmg,
+                    'aggro_percent': aggro, 'timestamp': ts, 'character_name': char})
+            self._invalidate_cache('events')
+        return len(events)
+
+    def add_wisdom(self, zone_id: int, amount: int):
+        with self._lock: self._wisdom_list.append({'zone_id': zone_id, 'amount': amount})
+
+    def get_damage_by_zones(self, zone_ids: List[int]) -> List[Dict]:
+        with self._lock:
+            events_df = self._get_events_df()
+            if events_df.empty: return []
+            zone_events = events_df[events_df['zone_id'].isin(zone_ids)]
+            if zone_events.empty: return []
+            # Calculate total damage per NPC for weighted aggro
+            npc_totals = zone_events.groupby(['zone_id', 'npc_id']).agg({'health_dmg': 'sum', 'armor_dmg': 'sum'}).reset_index()
+            npc_totals['npc_total'] = npc_totals['health_dmg'] + npc_totals['armor_dmg']
+            npc_total_map = {(r['zone_id'], r['npc_id']): r['npc_total'] for _, r in npc_totals.iterrows()}
+            results = []
+            for pid, grp in zone_events.groupby('player_id'):
+                # Calculate weighted aggro: sum of (aggro% * npc_total_damage) for each event
+                weighted_aggro = 0.0
+                for _, row in grp.iterrows():
+                    npc_total = npc_total_map.get((row['zone_id'], row['npc_id']), 0)
+                    weighted_aggro += (row['aggro_percent'] / 100.0) * npc_total
+                results.append({'player_id': pid, 'display_name': self._get_display_name(pid),
+                    'health_dmg': int(grp['health_dmg'].sum()), 'armor_dmg': int(grp['armor_dmg'].sum()),
+                    'total_dmg': int(grp['health_dmg'].sum() + grp['armor_dmg'].sum()),
+                    'weighted_aggro': int(weighted_aggro),
+                    'kills': len(grp['npc_id'].unique()), 'first_hit': grp['timestamp'].min(), 'last_hit': grp['timestamp'].max()})
+            return sorted(results, key=lambda x: x['total_dmg'], reverse=True)
+
+    def get_damage_in_time_range(self, start: datetime, end: datetime) -> List[Dict]:
+        with self._lock:
+            events_df = self._get_events_df()
+            if events_df.empty: return []
+            mask = (events_df['timestamp'] >= start) & (events_df['timestamp'] <= end)
+            range_events = events_df[mask]
+            if range_events.empty: return []
+            # Calculate total damage per NPC for weighted aggro
+            npc_totals = range_events.groupby(['zone_id', 'npc_id']).agg({'health_dmg': 'sum', 'armor_dmg': 'sum'}).reset_index()
+            npc_totals['npc_total'] = npc_totals['health_dmg'] + npc_totals['armor_dmg']
+            npc_total_map = {(r['zone_id'], r['npc_id']): r['npc_total'] for _, r in npc_totals.iterrows()}
+            results = []
+            for pid, grp in range_events.groupby('player_id'):
+                weighted_aggro = 0.0
+                for _, row in grp.iterrows():
+                    npc_total = npc_total_map.get((row['zone_id'], row['npc_id']), 0)
+                    weighted_aggro += (row['aggro_percent'] / 100.0) * npc_total
+                results.append({'player_id': pid, 'display_name': self._get_display_name(pid),
+                    'health_dmg': int(grp['health_dmg'].sum()), 'armor_dmg': int(grp['armor_dmg'].sum()),
+                    'total_dmg': int(grp['health_dmg'].sum() + grp['armor_dmg'].sum()),
+                    'weighted_aggro': int(weighted_aggro),
+                    'kills': len(grp['npc_id'].unique()), 'first_hit': grp['timestamp'].min(), 'last_hit': grp['timestamp'].max()})
+            return sorted(results, key=lambda x: x['total_dmg'], reverse=True)
+
+    def get_zones_combat_times(self, zone_ids: List[int]) -> Tuple[Optional[datetime], Optional[datetime], int]:
+        with self._lock:
+            events_df = self._get_events_df()
+            if events_df.empty: return None, None, 0
+            zone_events = events_df[events_df['zone_id'].isin(zone_ids)]
+            if zone_events.empty: return None, None, 0
+            kills = len(zone_events.groupby(['zone_id', 'npc_id']))
+            return zone_events['timestamp'].min(), zone_events['timestamp'].max(), kills
+
+    def get_all_zone_instances(self, zone_name: str = None, log_date: str = None) -> List[Dict]:
+        with self._lock:
+            results = []
+            for z in self._zones_list:
+                if zone_name and z['name'] != zone_name: continue
+                if log_date and z.get('log_date') != log_date: continue
+                results.append(z.copy())
+            return sorted(results, key=lambda x: x['entered_time'], reverse=True)
+
+    def get_zone_stats(self, zone_id: int) -> Dict:
+        with self._lock:
+            wisdom = sum(w['amount'] for w in self._wisdom_list if w['zone_id'] == zone_id)
+            events_df = self._get_events_df()
+            if events_df.empty: return {'wisdom': wisdom, 'kills': 0, 'total_dmg': 0}
+            zone_events = events_df[events_df['zone_id'] == zone_id]
+            if zone_events.empty: return {'wisdom': wisdom, 'kills': 0, 'total_dmg': 0}
+            return {'wisdom': wisdom, 'kills': len(zone_events['npc_id'].unique()),
+                    'total_dmg': int(zone_events['health_dmg'].sum() + zone_events['armor_dmg'].sum())}
+
+    def get_unique_zone_names(self) -> List[str]:
+        with self._lock: return sorted(set(z['name'] for z in self._zones_list))
+
+    def get_unique_log_dates(self) -> List[str]:
+        with self._lock: return sorted((z.get('log_date') for z in self._zones_list if z.get('log_date')), reverse=True)
+
+    def get_latest_damage_timestamp(self) -> Optional[datetime]:
+        with self._lock:
+            events_df = self._get_events_df()
+            return events_df['timestamp'].max() if not events_df.empty else None
+
+    def get_all_existing_event_keys(self, log_date: str = None) -> Set[Tuple]:
+        with self._lock:
+            events_df = self._get_events_df()
+            if events_df.empty: return set()
+            return {(r['zone_id'], r['npc_id'], r['player_id'], r['health_dmg'], r['armor_dmg']) for _, r in events_df.iterrows()}
+
+    def clear_all_data(self):
+        with self._lock:
+            self._players_list.clear(); self._zones_list.clear(); self._events_list.clear(); self._wisdom_list.clear()
+            self._invalidate_cache()
+            self._player_name_to_id.clear(); self._player_id_to_info.clear()
+            self._zone_id_to_info.clear(); self._zone_key_to_id.clear()
+            self._next_player_id = self._next_zone_id = self._next_event_id = 1
+
+    def get_stats(self) -> Dict:
+        with self._lock: return {'zones': len(self._zones_list), 'events': len(self._events_list), 'players': len(self._players_list)}
+
+    def get_monster_summary_by_zones(self, zone_ids: List[int], filter_text: str = None) -> List[Dict]:
+        """Get aggregated damage by monster name across selected zones."""
+        with self._lock:
+            events_df = self._get_events_df()
+            if events_df.empty: return []
+            zone_events = events_df[events_df['zone_id'].isin(zone_ids)]
+            if zone_events.empty: return []
             
-            self.config(cursor="")
+            # Group by npc_name and aggregate
+            results = []
+            for npc_name, grp in zone_events.groupby('npc_name'):
+                if filter_text and filter_text.lower() not in npc_name.lower():
+                    continue
+                kill_count = len(grp.groupby(['zone_id', 'npc_id']))  # Unique kills
+                results.append({
+                    'npc_name': npc_name,
+                    'health_dmg': int(grp['health_dmg'].sum()),
+                    'armor_dmg': int(grp['armor_dmg'].sum()),
+                    'total_dmg': int(grp['health_dmg'].sum() + grp['armor_dmg'].sum()),
+                    'kill_count': kill_count,
+                    'first_kill': grp['timestamp'].min(),
+                    'last_kill': grp['timestamp'].max()
+                })
+            return sorted(results, key=lambda x: x['total_dmg'], reverse=True)
+
+    def get_monster_player_summary(self, zone_ids: List[int], npc_name: str) -> List[Dict]:
+        """Get aggregated player damage for a specific monster type across zones, grouped by alias."""
+        with self._lock:
+            events_df = self._get_events_df()
+            if events_df.empty: return []
+            zone_events = events_df[(events_df['zone_id'].isin(zone_ids)) & (events_df['npc_name'] == npc_name)]
+            if zone_events.empty: return []
             
-            if not result.characters_found and not result.vendor_data:
-                messagebox.showinfo(
-                    "Scan Complete",
-                    "No vendor data found in the log file.\n\nMake sure you've interacted with vendors in-game.",
-                    parent=self
-                )
-                return
+            # Calculate total damage per NPC for weighted aggro
+            npc_totals = zone_events.groupby(['zone_id', 'npc_id']).agg({'health_dmg': 'sum', 'armor_dmg': 'sum'}).reset_index()
+            npc_totals['npc_total'] = npc_totals['health_dmg'] + npc_totals['armor_dmg']
+            npc_total_map = {(r['zone_id'], r['npc_id']): r['npc_total'] for _, r in npc_totals.iterrows()}
             
-            # Show results window
-            ScanResultsWindow(
-                self, result, self.db, self.current_character,
-                self._on_scan_import
-            )
-        
-        except Exception as e:
-            self.config(cursor="")
-            self._show_error(f"Error scanning log file: {e}")
-    
-    def _on_scan_import(self, character: str, npc_ids: List[int], scan_result: ScanResult):
-        """Handle import from scan results."""
-        # Build vendor list for character
-        vendors = self.db.load_vendors(character)
-        existing_ids = {v.npc_id for v in vendors}
-        
-        for npc_id in npc_ids:
-            if npc_id not in scan_result.vendor_data.get(character, {}):
-                continue
+            # First pass: group by player_id
+            player_data = []
+            for pid, grp in zone_events.groupby('player_id'):
+                weighted_aggro = 0.0
+                for _, row in grp.iterrows():
+                    npc_total = npc_total_map.get((row['zone_id'], row['npc_id']), 0)
+                    weighted_aggro += (row['aggro_percent'] / 100.0) * npc_total
+                
+                kills = len(grp.groupby(['zone_id', 'npc_id']))
+                player_data.append({
+                    'display_name': self._get_display_name(pid),
+                    'health_dmg': int(grp['health_dmg'].sum()),
+                    'armor_dmg': int(grp['armor_dmg'].sum()),
+                    'total_dmg': int(grp['health_dmg'].sum() + grp['armor_dmg'].sum()),
+                    'weighted_aggro': int(weighted_aggro),
+                    'kills': kills
+                })
             
-            council_left, reset_ts_ms, max_council = scan_result.vendor_data[character][npc_id]
-            npc_name = scan_result.npc_mappings.get(npc_id, f"Unknown_{npc_id}")
-            zone = scan_result.npc_zones.get(npc_id, self.db.get_npc_zone(npc_id))
-            if not zone or zone == 'Unknown':
-                zone = 'Unknown'
+            # Second pass: group by display_name (alias) to combine players with same alias
+            grouped = {}
+            for d in player_data:
+                key = d['display_name']
+                if key not in grouped:
+                    grouped[key] = {'display_name': key, 'health_dmg': 0, 'armor_dmg': 0, 'total_dmg': 0,
+                                   'weighted_aggro': 0, 'kills': 0}
+                g = grouped[key]
+                g['health_dmg'] += d['health_dmg']
+                g['armor_dmg'] += d['armor_dmg']
+                g['total_dmg'] += d['total_dmg']
+                g['weighted_aggro'] += d['weighted_aggro']
+                g['kills'] += d['kills']
             
-            if npc_id in existing_ids:
-                # Update existing
-                for vendor in vendors:
-                    if vendor.npc_id == npc_id:
-                        old_council = vendor.council_left
-                        
-                        if reset_ts_ms == 0:
-                            vendor.last_reset = datetime.now()
-                        else:
-                            reset_time = datetime.fromtimestamp(reset_ts_ms / 1000.0)
-                            vendor.last_reset = reset_time - timedelta(days=7)
-                        
-                        vendor.council_left = council_left
-                        if max_council > vendor.reset_maximum:
-                            vendor.reset_maximum = max_council
-                        
-                        # Update zone if we have better data
-                        if zone and zone != 'Unknown':
-                            vendor.zone = zone
-                        break
-            else:
-                # Create new vendor
-                new_vendor = Vendor.from_scan_data(
-                    npc_id, npc_name, zone,
-                    council_left, reset_ts_ms, max_council
-                )
-                vendors.append(new_vendor)
-                
-                self.db.log_transaction(
-                    character, npc_name, 'creation',
-                    0, council_left,
-                    f"Auto-scan import: {format_number(council_left)} council",
-                    npc_id
-                )
-        
-        # Save and refresh
-        self.db.save_vendors(vendors, character)
-        
-        # Update character list if new
-        if character not in self.characters:
-            self.characters.append(character)
-            self.characters.sort()
-            self._update_char_menu()
-        
-        # Switch to imported character
-        if character != self.current_character:
-            self.char_var.set(character)
-        else:
-            self.vendors = vendors
-            self.update_vendor_list()
-            self.update_total_values()
-    
-    def _open_add_vendor_window(self):
-        """Open window to add a new vendor."""
-        add_window = Toplevel(self)
-        add_window.title("Add New Vendor")
-        add_window.geometry("640x360")
-        
-        form = VendorForm(add_window)
-        form_frame = form.create_form()
-        form_frame.pack(fill=tk.BOTH, expand=True)
-        
-        button_line = tk.Frame(add_window)
-        button_line.pack(padx=10, pady=10, fill=tk.X)
-        
-        def add_and_save():
-            try:
-                values = form.get_values()
-                
-                time_obj = TimeUntilReset.from_inputs(
-                    values['days'], values['hours'], values['minutes'], 
-                    values['override_max_time']
-                )
-                last_reset = time_obj.calculate_last_reset(values['override_max_time'])
-                
-                new_vendor = Vendor(
-                    name=values['name'],
-                    zone=values['zone'],
-                    council_left=values['council'],
-                    last_reset=last_reset,
-                    reset_maximum=values['council'],
-                    categories=values['categories'],
-                    muted=values['muted'],
-                    npc_id=0
-                )
-                
-                self.db.log_transaction(
-                    self.current_character, values['name'], 'creation',
-                    0, values['council'],
-                    f"Vendor created with initial council: {format_number(values['council'])}"
-                )
-                
-                self.vendors.append(new_vendor)
-                self.db.save_vendors(self.vendors, self.current_character)
-                self.update_vendor_list()
-                self.update_total_values()
-                
-                messagebox.showinfo("Success", f"Vendor '{values['name']}' added.", parent=add_window)
-                add_window.destroy()
-            except ValueError as e:
-                self._show_error(str(e), add_window)
-            except Exception as e:
-                self._show_error(f"Could not add vendor: {e}", add_window)
-        
-        Button(button_line, text="Add", command=add_and_save).pack(side=tk.RIGHT, padx=6)
-        Button(button_line, text="Cancel", command=add_window.destroy).pack(side=tk.RIGHT)
-    
-    def _open_update_vendor_window(self, vendor: Vendor):
-        """Open window to update a vendor."""
-        update_window = Toplevel(self)
-        update_window.title(f"Update {vendor.name}")
-        update_window.geometry("640x450")
-        
-        form = VendorForm(update_window, vendor)
-        form_frame = form.create_form()
-        form_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Zone update field for scanned vendors
-        if vendor.npc_id:
-            zone_frame = tk.Frame(update_window)
-            zone_frame.pack(padx=10, fill=tk.X)
-            Label(zone_frame, text="Update Zone:").pack(side=tk.LEFT)
-            zone_entry = Entry(zone_frame, width=30)
-            zone_entry.insert(0, vendor.zone)
-            zone_entry.pack(side=tk.LEFT, padx=5)
+            return sorted(grouped.values(), key=lambda x: x['total_dmg'], reverse=True)
+
+    def get_monster_kill_details(self, zone_ids: List[int], npc_name: str) -> List[Dict]:
+        """Get details for each kill of a specific monster type across zones."""
+        with self._lock:
+            events_df = self._get_events_df()
+            if events_df.empty: return []
+            zone_events = events_df[(events_df['zone_id'].isin(zone_ids)) & (events_df['npc_name'] == npc_name)]
+            if zone_events.empty: return []
             
-            def save_zone():
-                new_zone = zone_entry.get().strip()
-                if new_zone:
-                    vendor.zone = new_zone
-                    self.db.update_npc_zone(vendor.npc_id, new_zone)
-                    messagebox.showinfo("Zone Updated", f"Zone updated to: {new_zone}", parent=update_window)
+            # Calculate total damage per NPC for weighted aggro
+            npc_totals = zone_events.groupby(['zone_id', 'npc_id']).agg({'health_dmg': 'sum', 'armor_dmg': 'sum'}).reset_index()
+            npc_totals['npc_total'] = npc_totals['health_dmg'] + npc_totals['armor_dmg']
+            npc_total_map = {(r['zone_id'], r['npc_id']): r['npc_total'] for _, r in npc_totals.iterrows()}
             
-            Button(zone_frame, text="Save Zone", command=save_zone).pack(side=tk.LEFT, padx=5)
-        
-        button_line = tk.Frame(update_window)
-        button_line.pack(padx=10, pady=10, fill=tk.X)
-        
-        def reset_now():
-            if messagebox.askyesno("Confirm Reset", f"Are you sure you want to reset {vendor.name}?", parent=update_window):
-                old_council = vendor.council_left
-                vendor.last_reset = datetime.now()
-                if vendor.reset_maximum > 0:
-                    vendor.council_left = vendor.reset_maximum
+            # Group by zone_id and npc_id to get individual kills
+            results = []
+            for (zone_id, npc_id), kill_grp in zone_events.groupby(['zone_id', 'npc_id']):
+                zone_name = self._zone_id_to_info.get(zone_id, {}).get('name', 'Unknown')
+                total_dmg = int(kill_grp['health_dmg'].sum() + kill_grp['armor_dmg'].sum())
+                kill_time = kill_grp['timestamp'].max()
+                npc_total = npc_total_map.get((zone_id, npc_id), total_dmg)
                 
-                self.db.log_transaction(
-                    self.current_character, vendor.name, 'reset',
-                    old_council, vendor.council_left,
-                    f"Manual reset from {format_number(old_council)} to {format_number(vendor.council_left)}",
-                    vendor.npc_id
-                )
-                
-                self.db.save_vendors(self.vendors, self.current_character)
-                self.update_vendor_list()
-                self.update_total_values()
-                messagebox.showinfo("Success", f"Vendor '{vendor.name}' has been reset.", parent=update_window)
-                update_window.destroy()
-        
-        def update_vendor_action():
-            try:
-                old_council = vendor.council_left
-                values = form.get_values()
-                
-                time_obj = TimeUntilReset.from_inputs(
-                    values['days'], values['hours'], values['minutes'],
-                    values['override_max_time']
-                )
-                
-                vendor.council_left = values['council']
-                if values['council'] > vendor.reset_maximum:
-                    vendor.reset_maximum = values['council']
-                vendor.last_reset = time_obj.calculate_last_reset(values['override_max_time'])
-                vendor.muted = values['muted']
-                vendor.categories = values['categories']
-                
-                if old_council != values['council']:
-                    transaction_type = 'purchase' if values['council'] < old_council else 'adjustment'
-                    self.db.log_transaction(
-                        self.current_character, vendor.name, transaction_type,
-                        old_council, values['council'],
-                        f"Manual update: {format_number(old_council)} → {format_number(values['council'])}",
-                        vendor.npc_id
-                    )
-                
-                self.db.save_vendors(self.vendors, self.current_character)
-                self.update_vendor_list()
-                self.update_total_values()
-                messagebox.showinfo("Success", f"Vendor '{vendor.name}' updated.", parent=update_window)
-                update_window.destroy()
-            except ValueError as e:
-                self._show_error(str(e), update_window)
-            except Exception as e:
-                self._show_error(f"Could not update vendor: {e}", update_window)
-        
-        Button(button_line, text="Reset Now", command=reset_now, fg="red").pack(side=tk.LEFT, padx=6)
-        Button(button_line, text="Update", command=update_vendor_action).pack(side=tk.RIGHT, padx=6)
-        Button(button_line, text="Close", command=update_window.destroy).pack(side=tk.RIGHT)
-    
-    def _delete_vendor(self, vendor: Vendor):
-        """Delete a vendor."""
-        if messagebox.askyesno("Delete Vendor", f"Are you sure you want to delete {vendor.name}?", parent=self):
-            self.db.log_transaction(
-                self.current_character, vendor.name, 'deletion',
-                vendor.council_left, 0,
-                f"Vendor deleted with {vendor.council_left} council remaining",
-                vendor.npc_id
-            )
-            
-            # Delete by name+zone (the canonical identifier)
-            self.vendors = [v for v in self.vendors if not (v.name == vendor.name and v.zone == vendor.zone)]
-            self.db.save_vendors(self.vendors, self.current_character)
-            self.update_vendor_list()
-            self.update_total_values()
-            messagebox.showinfo("Deleted", f"{vendor.name} has been deleted.", parent=self)
-    
-    def _toggle_mute_vendor(self, vendor: Vendor):
-        """Toggle vendor mute status."""
-        vendor.muted = not vendor.muted
-        self.db.save_vendors(self.vendors, self.current_character)
-        self.update_vendor_list()
-        self.update_total_values()
-        status = "muted" if vendor.muted else "unmuted"
-        messagebox.showinfo("Success", f"{vendor.name} has been {status}.", parent=self)
-    
-    def update_vendor_list(self):
-        """Update the vendor list display."""
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-        self.pulse_widgets.clear()
-        
-        # Safety check - filter_var might not be initialized yet
-        if self.filter_var is None:
-            filter_text = ""
-        else:
-            filter_text = self.filter_var.get()
-        
-        if self.show_muted_var is None:
-            show_muted = False
-        else:
-            show_muted = self.show_muted_var.get()
-        
-        displayed_vendors = [
-            v for v in self.vendors
-            if (show_muted or not v.muted) and v.matches_filter(filter_text)
-        ]
-        
-        not_ready = [v for v in displayed_vendors if not v.is_ready_to_reset]
-        if not_ready:
-            times = [(v.next_reset - datetime.now()).total_seconds() for v in not_ready]
-            max_time = max(times)
-            min_time = min(times)
-        else:
-            max_time = min_time = 0
-        
-        displayed_vendors.sort(key=lambda v: v.next_reset)
-        
-        callbacks = {
-            'update': self._open_update_vendor_window,
-            'delete': self._delete_vendor,
-            'toggle_mute': self._toggle_mute_vendor
-        }
-        
-        for vendor in displayed_vendors:
-            card = VendorCard(self.scrollable_frame, vendor, min_time, max_time, callbacks)
-            
-            if card.widgets_for_pulse:
-                for widget in card.widgets_for_pulse:
-                    self.pulse_widgets.append({
-                        'widget': widget,
-                        'vendor_name': vendor.name
+                # Get player breakdown for this kill
+                player_dmg = []
+                for pid, player_grp in kill_grp.groupby('player_id'):
+                    weighted_aggro = (player_grp['aggro_percent'].max() / 100.0) * npc_total
+                    player_dmg.append({
+                        'display_name': self._get_display_name(pid),
+                        'health_dmg': int(player_grp['health_dmg'].sum()),
+                        'armor_dmg': int(player_grp['armor_dmg'].sum()),
+                        'total_dmg': int(player_grp['health_dmg'].sum() + player_grp['armor_dmg'].sum()),
+                        'weighted_aggro': int(weighted_aggro),
+                        'aggro_percent': float(player_grp['aggro_percent'].max())
                     })
-    
-    def update_total_values(self):
-        """Update the total values display."""
-        try:
-            unmuted_vendors = [v for v in self.vendors if not v.muted]
-            total_council = sum(v.council_left for v in unmuted_vendors)
-            total_maximum = sum(v.reset_maximum for v in unmuted_vendors)
-            total_earned_7d = self.db.get_council_earned(self.current_character, days=7)
+                player_dmg.sort(key=lambda x: x['total_dmg'], reverse=True)
+                
+                results.append({
+                    'zone_id': zone_id,
+                    'npc_id': npc_id,
+                    'zone_name': zone_name,
+                    'total_dmg': total_dmg,
+                    'kill_time': kill_time,
+                    'players': player_dmg
+                })
+            return sorted(results, key=lambda x: x['kill_time'], reverse=True)
+
+
+class LogParser:
+    def __init__(self, data_store: PandasDataStore, event_queue: queue.Queue):
+        self.data_store = data_store
+        self.event_queue = event_queue
+        self.current_character = self.current_zone = self.current_zone_id = None
+        self.current_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        self.last_timestamp = self.log_date = None
+        self.batch_mode = False
+        self.pending_events, self.seen_events, self.zones_created = [], set(), {}
+        self.last_zone_name = self.last_zone_time = None
+        self.zone_debounce_seconds = 30
+
+    def set_log_date(self, date_str: str):
+        self.log_date = date_str
+        try: self.current_date = datetime.strptime(date_str, '%Y-%m-%d')
+        except: pass
+
+    def reset(self):
+        self.current_character = self.current_zone = self.current_zone_id = None
+        self.last_timestamp = None
+        self.pending_events.clear(); self.seen_events.clear(); self.zones_created.clear()
+        self.last_zone_name = self.last_zone_time = None
+
+    def start_batch_mode(self, existing_events: Set[Tuple] = None):
+        self.batch_mode = True; self.pending_events.clear()
+        self.seen_events = existing_events or set(); self.zones_created.clear()
+
+    def end_batch_mode(self) -> int:
+        self.batch_mode = False; count = self._flush_batch(); self.pending_events.clear(); return count
+
+    def _flush_batch(self) -> int:
+        if not self.pending_events: return 0
+        player_ids = self.data_store.get_or_create_players_batch({e.player_name for e in self.pending_events})
+        events_to_insert = []
+        for e in self.pending_events:
+            pid = player_ids.get(e.player_name)
+            if not pid: continue
+            zid = e.zone_id
+            if not zid:
+                zone_key = (e.zone_name, e.character_name)
+                zid = self.zones_created.get(zone_key) or self.data_store.create_zone_entry(e.zone_name, e.character_name, e.timestamp, self.log_date)
+                self.zones_created[zone_key] = zid
+            if not zid: continue
+            dedup_key = (zid, e.npc_id, pid, e.health_dmg, e.armor_dmg)
+            if dedup_key in self.seen_events: continue
+            self.seen_events.add(dedup_key)
+            events_to_insert.append((zid, e.npc_id, e.npc_name, pid, e.health_dmg, e.armor_dmg, e.aggro_percent, e.timestamp, e.character_name))
+        count = self.data_store.insert_damage_events_batch(events_to_insert)
+        self.pending_events.clear()
+        return count
+
+    def parse_timestamp(self, time_str: str) -> datetime:
+        time_obj = datetime.strptime(time_str, '%H:%M:%S').time()
+        result = datetime.combine(self.current_date.date(), time_obj)
+        if self.last_timestamp and result < self.last_timestamp:
+            self.current_date += timedelta(days=1)
+            result = datetime.combine(self.current_date.date(), time_obj)
+        self.last_timestamp = result
+        return result
+
+    def parse_line(self, line: str) -> Optional[DamageEvent]:
+        line = line.strip()
+        if not line: return None
+
+        char_match = CHARACTER_PATTERN.search(line)
+        if char_match:
+            self.current_character = char_match.group(1)
+            if not self.batch_mode: self.event_queue.put(('character', self.current_character))
+            return None
+
+        for pattern in ZONE_PATTERNS:
+            m = pattern.search(line)
+            if m:
+                time_str, zone_name = m.groups()
+                if zone_name in SKIP_ZONES: continue
+                ts = self.parse_timestamp(time_str)
+                if self.last_zone_name == zone_name and self.last_zone_time and (ts - self.last_zone_time).total_seconds() < self.zone_debounce_seconds:
+                    self.current_zone = ZoneInfo(zone_name, ts, self.current_character); return None
+                self.current_zone = ZoneInfo(zone_name, ts, self.current_character)
+                self.last_zone_name, self.last_zone_time = zone_name, ts
+                self.current_zone_id = self.data_store.create_zone_entry(zone_name, self.current_character, ts, self.log_date)
+                if self.batch_mode: self.zones_created[(zone_name, self.current_character)] = self.current_zone_id
+                else: self.event_queue.put(('zone', zone_name, ts))
+                return None
+
+        wisdom_match = WISDOM_PATTERN.search(line)
+        if wisdom_match and self.current_zone_id:
+            self.data_store.add_wisdom(self.current_zone_id, int(wisdom_match.group(1))); return None
+
+        # New format: entire corpse data is on single line
+        corpse_match = CORPSE_PATTERN.search(line)
+        if corpse_match:
+            ts_match = TIMESTAMP_PATTERN.match(line)
+            ts = self.parse_timestamp(ts_match.group(1)) if ts_match else datetime.now()
+            npc_id = int(corpse_match.group(1))
+            npc_name = corpse_match.group(2).strip()
+            content = corpse_match.group(3)
             
-            self.total_council_label.config(text=f"Current Vendor Council Pool: {format_number(total_council)}")
-            self.total_max_label.config(text=f"Total Vendor Cash: {format_number(total_maximum)}")
-            self.earned_7d_label.config(text=f"Council earned (7d): {format_number(total_earned_7d)}")
-        except Exception as e:
-            print(f"Error updating total values: {e}")
-    
-    def _update_pulse_animation(self):
-        """Update pulse animation for ready vendors."""
-        if not self.timer_running:
-            return
-        
-        try:
-            self.pulse_frame = (self.pulse_frame + 1) % PULSE_FRAME_MAX
-            pulse_color = calculate_pulse_color(self.pulse_frame)
+            # Check if there's actual damage data (look for "Detailed Analysis")
+            if '<h2>Detailed Analysis:</h2>' not in content:
+                return None
             
-            widgets_to_remove = []
-            for widget_info in self.pulse_widgets:
-                widget = widget_info['widget']
-                try:
-                    if widget.winfo_exists():
-                        widget.config(bg=pulse_color)
+            # Extract the damage section after "Detailed Analysis"
+            analysis_start = content.find('<h2>Detailed Analysis:</h2>')
+            if analysis_start == -1:
+                return None
+            damage_section = content[analysis_start + len('<h2>Detailed Analysis:</h2>'):]
+            
+            # Split by literal \n (backslash-n in the log file)
+            # In Python string literals, '\\n' represents the two-character sequence backslash + n
+            damage_lines = damage_section.split('\\n')
+            
+            last_event = None
+            for damage_line in damage_lines:
+                damage_line = damage_line.strip()
+                if not damage_line:
+                    continue
+                    
+                damage_match = DAMAGE_PATTERN.match(damage_line)
+                if damage_match:
+                    player_name = damage_match.group(1).strip()
+                    h_dmg = int(damage_match.group(2)) if damage_match.group(2) else 0
+                    a_dmg = int(damage_match.group(3)) if damage_match.group(3) else 0
+                    
+                    # Skip entries with no damage
+                    if h_dmg == 0 and a_dmg == 0:
+                        continue
+                        
+                    aggro = float(damage_match.group(4)) if damage_match.group(4) else 0.0
+                    
+                    event = DamageEvent(player_name, h_dmg, a_dmg, aggro, npc_id, npc_name,
+                                       self.current_zone.name if self.current_zone else "Unknown", ts,
+                                       self.current_character, self.current_zone_id)
+                    
+                    if self.batch_mode:
+                        self.pending_events.append(event)
+                        if len(self.pending_events) >= BATCH_SIZE: self._flush_batch()
                     else:
-                        widgets_to_remove.append(widget_info)
-                except tk.TclError:
-                    widgets_to_remove.append(widget_info)
+                        if self.data_store.insert_damage_event(event, self.current_zone_id) != -1:
+                            self.event_queue.put(('damage', event))
+                    
+                    last_event = event
             
-            for widget_info in widgets_to_remove:
-                self.pulse_widgets.remove(widget_info)
-        except Exception as e:
-            print(f"Error updating pulse animation: {e}")
+            return last_event
         
-        self.after(PULSE_UPDATE_MS, self._update_pulse_animation)
-    
-    def _update_timers(self):
-        """Update timer displays."""
-        if not self.timer_running:
+        return None
+
+
+class LogMonitor:
+    def __init__(self, log_path: str, parser: LogParser):
+        self.log_path, self.parser = log_path, parser
+        self.running = False; self.thread = None
+        self.reader = PlayerLogReader(log_path)
+
+    def start(self, from_position: int = 0):
+        if self.running: return
+        self.running = True; self.reader.set_position(from_position)
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True); self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread: self.thread.join(timeout=2)
+
+    def _monitor_loop(self):
+        try:
+            while self.running:
+                for line in self.reader.read_new_lines():
+                    if not self.running: break
+                    try: self.parser.parse_line(line)
+                    except: pass
+                if self.running: time.sleep(0.1)
+        except Exception as e: self.parser.event_queue.put(('error', str(e)))
+
+
+class BackgroundLoader:
+    def __init__(self, data_store: PandasDataStore, progress_cb=None, complete_cb=None):
+        self.data_store, self.progress_cb, self.complete_cb = data_store, progress_cb, complete_cb
+        self.thread = None; self.cancel_requested = False
+
+    def load_file(self, log_path: str, log_date: str):
+        self.cancel_requested = False
+        self.thread = threading.Thread(target=self._load_worker, args=(log_path, log_date), daemon=True)
+        self.thread.start()
+
+    def cancel(self): self.cancel_requested = True
+
+    def _load_worker(self, log_path: str, log_date: str):
+        try:
+            file_size = os.path.getsize(log_path)
+            parser = LogParser(self.data_store, queue.Queue())
+            parser.set_log_date(log_date)
+            if self.progress_cb: self.progress_cb(0, "Checking for duplicates...")
+            parser.start_batch_mode(self.data_store.get_all_existing_event_keys(log_date))
+            if self.progress_cb: self.progress_cb(0, "Loading log file...")
+            line_count = damage_count = last_progress = 0
+            current_char = current_zone = None
+            with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                while True:
+                    if self.cancel_requested:
+                        if self.complete_cb: self.complete_cb(False, "Cancelled", 0, 0, None, None)
+                        return
+                    line = f.readline()
+                    if not line: break
+                    line_count += 1
+                    try:
+                        if parser.parse_line(line): damage_count += 1
+                        if parser.current_character != current_char: current_char = parser.current_character
+                        if parser.current_zone and parser.current_zone.name != current_zone: current_zone = parser.current_zone.name
+                    except: pass
+                    if line_count % 10000 == 0:
+                        progress = int((f.tell() / file_size) * 100)
+                        if progress != last_progress and self.progress_cb:
+                            self.progress_cb(progress, f"Processing... {line_count:,} lines, {damage_count:,} damage events")
+                            last_progress = progress
+            if self.progress_cb: self.progress_cb(95, "Finalizing...")
+            damage_count += parser.end_batch_mode()
+            if self.progress_cb: self.progress_cb(100, "Complete!")
+            if self.complete_cb: self.complete_cb(True, f"Loaded {line_count:,} lines, {damage_count:,} damage events", line_count, damage_count, current_char, current_zone)
+        except Exception as e:
+            if self.complete_cb: self.complete_cb(False, f"Error: {str(e)}", 0, 0, None, None)
+
+
+class DamageParserGUI:
+    def __init__(self, log_path: str = None):
+        self.root = tk.Tk()
+        self.root.title("AnatomyDPS - Project Gorgon Damage Parser")
+        self.root.geometry("1300x850")
+        self.log_path = log_path or DEFAULT_LOG_PATH
+        self.data_store = PandasDataStore()
+        self.event_queue = queue.Queue()
+        self.parser = LogParser(self.data_store, self.event_queue)
+        self.monitor = self.loader = None
+        self.current_character = self.current_zone = self.current_zone_id = None
+        self.monitoring_active = self.loading_active = False
+        self.config = load_config()
+        self.timezone_var = tk.StringVar(value=self.config.get('timezone', 'EST (UTC-5)'))
+        self.min_wisdom_var = tk.StringVar(value="")  # Shared between Zone Runs and Monsters tabs
+        self.mini_window = None
+        self._create_ui()
+        self._start_event_processor()
+        self._start_auto_refresh()
+        self.root.after(100, self._auto_start)
+
+    def _get_tz_offset(self) -> int: return TIMEZONE_OPTIONS.get(self.timezone_var.get(), -5)
+    def _apply_tz(self, dt): return dt + timedelta(hours=self._get_tz_offset()) if dt else None
+    def _format_time(self, dt): return self._apply_tz(dt).strftime('%H:%M:%S') if dt else "--"
+
+    def _auto_start(self):
+        if os.path.exists(self.log_path):
+            self._add_feed_line("Auto-loading player.log (full file)...", 'character')
+            self._load_file_background(self.log_path, monitor_after=True)
+        else:
+            self._add_feed_line(f"Player.log not found at: {self.log_path}", 'error')
+
+    def _create_ui(self):
+        # Menu
+        menubar = tk.Menu(self.root); self.root.config(menu=menubar)
+        file_menu = tk.Menu(menubar, tearoff=0); menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Import Log File...", command=self._import_log_file)
+        file_menu.add_command(label="Export to CSV...", command=self._export_csv)
+        file_menu.add_separator(); file_menu.add_command(label="Exit", command=self._on_close)
+        session_menu = tk.Menu(menubar, tearoff=0); menubar.add_cascade(label="Session", menu=session_menu)
+        session_menu.add_command(label="Clear All Data", command=self._clear_all_data)
+        view_menu = tk.Menu(menubar, tearoff=0); menubar.add_cascade(label="View", menu=view_menu)
+        tz_menu = tk.Menu(view_menu, tearoff=0); view_menu.add_cascade(label="Timezone", menu=tz_menu)
+        for tz in TIMEZONE_OPTIONS: tz_menu.add_radiobutton(label=tz, variable=self.timezone_var, value=tz, command=self._on_tz_changed)
+
+        # Control bar
+        ctrl = ttk.Frame(self.root, padding="5"); ctrl.pack(fill='x')
+        self.monitor_btn = ttk.Button(ctrl, text="▶ Start Monitoring", command=self._toggle_monitoring); self.monitor_btn.pack(side='left', padx=5)
+        ttk.Button(ctrl, text="Import Log...", command=self._import_log_file).pack(side='left', padx=5)
+        ttk.Button(ctrl, text="📊 Mini View", command=self._open_mini_window).pack(side='left', padx=5)
+        self.char_label = ttk.Label(ctrl, text="Character: --"); self.char_label.pack(side='left', padx=20)
+        self.zone_label = ttk.Label(ctrl, text="Zone: --"); self.zone_label.pack(side='left', padx=20)
+        self.log_date_label = ttk.Label(ctrl, text="Log Date: --"); self.log_date_label.pack(side='left', padx=20)
+        self.tz_label = ttk.Label(ctrl, text=f"TZ: {self.timezone_var.get()}"); self.tz_label.pack(side='left', padx=10)
+        self.status_label = ttk.Label(ctrl, text="Status: Idle", foreground='red'); self.status_label.pack(side='right', padx=5)
+
+        # Progress bar
+        self.progress_frame = ttk.Frame(self.root)
+        self.progress_var = tk.DoubleVar()
+        ttk.Progressbar(self.progress_frame, variable=self.progress_var, maximum=100, length=400).pack(side='left', padx=5)
+        self.progress_label = ttk.Label(self.progress_frame, text=""); self.progress_label.pack(side='left', padx=10)
+        ttk.Button(self.progress_frame, text="Cancel", command=lambda: self.loader and self.loader.cancel()).pack(side='left', padx=5)
+
+        # Notebook
+        self.notebook = ttk.Notebook(self.root); self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
+        self._create_feed_tab()
+        self._create_rolling_tab()
+        self._create_zones_tab()
+        self._create_monsters_tab()
+        self._create_alias_tab()
+
+    def _create_feed_tab(self):
+        frame = ttk.Frame(self.notebook, padding="5"); self.notebook.add(frame, text="Live Feed")
+        self.feed_text = tk.Text(frame, wrap='word', height=30, state='disabled', font=('Consolas', 10))
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=self.feed_text.yview)
+        self.feed_text.configure(yscrollcommand=scroll.set)
+        self.feed_text.pack(side='left', fill='both', expand=True); scroll.pack(side='right', fill='y')
+        for tag, color, bold in [('zone','#2196F3',True),('damage','#4CAF50',False),('character','#FF9800',True),('error','#F44336',False)]:
+            self.feed_text.tag_configure(tag, foreground=color, font=('Consolas', 10, 'bold') if bold else None)
+
+    def _create_rolling_tab(self):
+        frame = ttk.Frame(self.notebook, padding="5"); self.notebook.add(frame, text="Last 5 Minutes")
+        top = ttk.Frame(frame); top.pack(fill='x', pady=5)
+        ttk.Label(top, text="Window (minutes):").pack(side='left')
+        self.window_var = tk.StringVar(value="5"); ttk.Entry(top, textvariable=self.window_var, width=5).pack(side='left', padx=5)
+        ttk.Button(top, text="Refresh", command=self._refresh_rolling).pack(side='left', padx=5)
+        self.rolling_info = ttk.Label(top, text=""); self.rolling_info.pack(side='left', padx=20)
+        self.rolling_tree = create_treeview(frame, ('Player','Health Dmg','Armor Dmg','Total Dmg','Aggro Est','DPS','% of Group','Kills'), [180,90,90,100,90,80,80,60])
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=self.rolling_tree.yview)
+        self.rolling_tree.configure(yscrollcommand=scroll.set)
+        self.rolling_tree.pack(side='left', fill='both', expand=True); scroll.pack(side='right', fill='y')
+
+    def _create_zones_tab(self):
+        frame = ttk.Frame(self.notebook, padding="5"); self.notebook.add(frame, text="Zone Runs")
+        filt = ttk.LabelFrame(frame, text="Filters", padding="5"); filt.pack(fill='x', pady=5)
+        ttk.Label(filt, text="Min Wisdom:").pack(side='left')
+        ttk.Entry(filt, textvariable=self.min_wisdom_var, width=8).pack(side='left', padx=5)
+        ttk.Button(filt, text="Refresh", command=self._refresh_zones_and_monsters).pack(side='left', padx=10)
+
+        paned = ttk.PanedWindow(frame, orient='vertical'); paned.pack(fill='both', expand=True)
+        zones_frame = ttk.LabelFrame(paned, text="Zone Runs (Ctrl/Shift for multi-select)", padding="5"); paned.add(zones_frame, weight=1)
+        self.zones_tree = ttk.Treeview(zones_frame, columns=('Zone','Character','Date','Entered','Left','Wisdom','Kills','Total Damage'), show='headings', selectmode='extended')
+        for col, w in [('Zone',150),('Character',120),('Date',100),('Entered',100),('Left',100),('Wisdom',90),('Kills',90),('Total Damage',100)]:
+            self.zones_tree.heading(col, text=col); self.zones_tree.column(col, width=w, anchor='w' if col in ('Zone','Character') else 'center')
+        make_treeview_sortable(self.zones_tree, preserve_selection=True)
+        self.zones_tree.pack(side='left', fill='both', expand=True)
+        ttk.Scrollbar(zones_frame, orient='vertical', command=self.zones_tree.yview).pack(side='right', fill='y')
+        self.zones_tree.bind('<<TreeviewSelect>>', lambda e: self._update_session())
+
+        totals = ttk.LabelFrame(paned, text="Damage Totals (selected runs)", padding="5"); paned.add(totals, weight=2)
+        copy_frame = ttk.Frame(totals); copy_frame.pack(fill='x', pady=2)
+        ttk.Button(copy_frame, text="Copy Full", command=lambda: self._copy_zones(False)).pack(side='left', padx=2)
+        ttk.Button(copy_frame, text="Copy Compact", command=lambda: self._copy_zones(True)).pack(side='left', padx=2)
+        self.selected_label = ttk.Label(totals, text="No zones selected"); self.selected_label.pack(fill='x', pady=2)
+        self.session_tree = create_treeview(totals, ('Player','Health Dmg','Armor Dmg','Total Dmg','Aggro Est','DPS','%','Kills'), [180,90,90,100,90,80,60,60], height=10)
+        scroll = ttk.Scrollbar(totals, orient='vertical', command=self.session_tree.yview)
+        self.session_tree.configure(yscrollcommand=scroll.set)
+        self.session_tree.pack(side='left', fill='both', expand=True); scroll.pack(side='right', fill='y')
+
+    def _create_alias_tab(self):
+        frame = ttk.Frame(self.notebook, padding="5"); self.notebook.add(frame, text="Player Aliases")
+        top = ttk.Frame(frame); top.pack(fill='x', pady=5)
+        ttk.Label(top, text="Filter by name:").pack(side='left')
+        self.alias_filter_var = tk.StringVar()
+        self.alias_filter_var.trace_add('write', lambda *a: self._refresh_aliases())
+        ttk.Entry(top, textvariable=self.alias_filter_var, width=30).pack(side='left', padx=5)
+        ttk.Button(top, text="Refresh", command=self._refresh_aliases).pack(side='left', padx=10)
+        ttk.Label(top, text="(Double-click to edit. Same alias = grouped damage.)").pack(side='left', padx=20)
+        self.alias_tree = create_treeview(frame, ('Original Name','Alias'), [250,250])
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=self.alias_tree.yview)
+        self.alias_tree.configure(yscrollcommand=scroll.set)
+        self.alias_tree.pack(side='left', fill='both', expand=True); scroll.pack(side='right', fill='y')
+        self.alias_tree.bind('<Double-1>', self._edit_alias)
+
+    def _create_monsters_tab(self):
+        frame = ttk.Frame(self.notebook, padding="5"); self.notebook.add(frame, text="Monsters")
+        
+        # Filter section - uses shared min_wisdom_var
+        filt = ttk.LabelFrame(frame, text="Filters", padding="5"); filt.pack(fill='x', pady=5)
+        ttk.Label(filt, text="Min Wisdom:").pack(side='left')
+        ttk.Entry(filt, textvariable=self.min_wisdom_var, width=8).pack(side='left', padx=5)
+        ttk.Button(filt, text="Refresh", command=self._refresh_zones_and_monsters).pack(side='left', padx=10)
+        
+        paned = ttk.PanedWindow(frame, orient='vertical'); paned.pack(fill='both', expand=True)
+        
+        # Zone selection (same as zones tab)
+        zones_frame = ttk.LabelFrame(paned, text="Zone Runs (Ctrl/Shift for multi-select)", padding="5"); paned.add(zones_frame, weight=1)
+        self.monster_zones_tree = ttk.Treeview(zones_frame, columns=('Zone','Character','Date','Entered','Left','Wisdom','Kills','Total Damage'), show='headings', selectmode='extended')
+        for col, w in [('Zone',150),('Character',120),('Date',100),('Entered',100),('Left',100),('Wisdom',90),('Kills',90),('Total Damage',100)]:
+            self.monster_zones_tree.heading(col, text=col); self.monster_zones_tree.column(col, width=w, anchor='w' if col in ('Zone','Character') else 'center')
+        make_treeview_sortable(self.monster_zones_tree, preserve_selection=True)
+        self.monster_zones_tree.pack(side='left', fill='both', expand=True)
+        ttk.Scrollbar(zones_frame, orient='vertical', command=self.monster_zones_tree.yview).pack(side='right', fill='y')
+        self.monster_zones_tree.bind('<<TreeviewSelect>>', lambda e: self._update_monster_list())
+        
+        # Monster list with filter
+        monsters_frame = ttk.LabelFrame(paned, text="Monsters (expand to see player damage breakdown)", padding="5"); paned.add(monsters_frame, weight=2)
+        
+        # Monster filter row
+        monster_filter_row = ttk.Frame(monsters_frame); monster_filter_row.pack(fill='x', pady=2)
+        ttk.Label(monster_filter_row, text="Filter monsters:").pack(side='left')
+        self.monster_name_filter_var = tk.StringVar()
+        self.monster_name_filter_var.trace_add('write', lambda *a: self._update_monster_list())
+        ttk.Entry(monster_filter_row, textvariable=self.monster_name_filter_var, width=30).pack(side='left', padx=5)
+        self.monster_summary_label = ttk.Label(monster_filter_row, text="No zones selected")
+        self.monster_summary_label.pack(side='left', padx=20)
+        
+        # Monster tree - hierarchical with ability to expand
+        monster_cols = ('Name','Health Dmg','Armor Dmg','Total Dmg','Aggro Est','Kills')
+        self.monster_tree = ttk.Treeview(monsters_frame, columns=monster_cols, show='tree headings', height=15)
+        self.monster_tree.heading('#0', text='')
+        self.monster_tree.column('#0', width=30, stretch=False)
+        for col, w, anchor in [('Name',220,'w'),('Health Dmg',90,'center'),('Armor Dmg',90,'center'),('Total Dmg',100,'center'),('Aggro Est',90,'center'),('Kills',60,'center')]:
+            self.monster_tree.heading(col, text=col)
+            self.monster_tree.column(col, width=w, anchor=anchor)
+        
+        # Make monster tree sortable (top-level only)
+        self._make_monster_tree_sortable()
+        
+        monster_scroll = ttk.Scrollbar(monsters_frame, orient='vertical', command=self.monster_tree.yview)
+        self.monster_tree.configure(yscrollcommand=monster_scroll.set)
+        self.monster_tree.pack(side='left', fill='both', expand=True)
+        monster_scroll.pack(side='right', fill='y')
+        
+        # Bind expand/collapse to load details
+        self.monster_tree.bind('<<TreeviewOpen>>', self._on_monster_expand)
+
+    def _make_monster_tree_sortable(self):
+        """Make monster tree sortable by column headers (top-level items only)."""
+        def sort_column(col, reverse):
+            # Get only top-level items
+            items = [(self.monster_tree.set(k, col), k) for k in self.monster_tree.get_children('')]
+            def parse_val(v):
+                v = v.replace(',', '').replace('%', '').strip()
+                if v in ('--', '', '(no data)'):
+                    return float('-inf') if not reverse else float('inf')
+                try:
+                    return float(v)
+                except:
+                    return v.lower() if isinstance(v, str) else v
+            try:
+                items.sort(key=lambda t: parse_val(t[0]), reverse=reverse)
+            except TypeError:
+                items.sort(key=lambda t: str(t[0]), reverse=reverse)
+            for i, (_, k) in enumerate(items):
+                self.monster_tree.move(k, '', i)
+            self.monster_tree.heading(col, command=lambda: sort_column(col, not reverse))
+        
+        for col in self.monster_tree['columns']:
+            self.monster_tree.heading(col, command=lambda c=col: sort_column(c, False))
+
+    def _show_progress(self, show):
+        if show: self.progress_frame.pack(fill='x', padx=5, pady=2, before=self.notebook)
+        else: self.progress_frame.pack_forget()
+
+    def _on_tz_changed(self):
+        self.config['timezone'] = self.timezone_var.get(); save_config(self.config)
+        self._add_feed_line(f"Timezone changed to {self.timezone_var.get()}", 'character')
+        self._refresh_zones(); self.tz_label.config(text=f"TZ: {self.timezone_var.get()}")
+
+    def _load_file_background(self, log_path: str, monitor_after: bool = False):
+        if self.loading_active: messagebox.showwarning("Loading", "Already loading a file."); return
+        if not os.path.exists(log_path): messagebox.showerror("Error", f"Log file not found:\n{log_path}"); return
+        if self.monitor: self.monitor.stop(); self.monitor = None
+        log_date = datetime.fromtimestamp(os.path.getmtime(log_path)).strftime('%Y-%m-%d')
+        self.log_date_label.config(text=f"Log Date: {log_date}")
+        self.loading_active = True; self._show_progress(True)
+        self.monitor_btn.config(state='disabled'); self.status_label.config(text="Status: Loading...", foreground='red')
+        self._add_feed_line(f"Loading: {log_path}", 'character')
+        def on_progress(p, m): self.root.after(0, lambda: (self.progress_var.set(p), self.progress_label.config(text=m)))
+        def on_complete(ok, msg, lines, events, char, zone):
+            self.root.after(0, lambda: self._on_load_complete(ok, msg, char, zone, log_path, monitor_after))
+        self.loader = BackgroundLoader(self.data_store, on_progress, on_complete)
+        self.loader.load_file(log_path, log_date)
+
+    def _on_load_complete(self, success, msg, char, zone, log_path, monitor_after):
+        self.loading_active = False; self._show_progress(False); self.monitor_btn.config(state='normal')
+        if success:
+            self._add_feed_line(msg, 'character')
+            stats = self.data_store.get_stats()
+            self._add_feed_line(f"Data loaded: {stats['zones']} zones, {stats['events']} events, {stats['players']} players", 'character')
+            if char: self.current_character = char; self.char_label.config(text=f"Character: {char}")
+            if zone: self.current_zone = zone; self.zone_label.config(text=f"Zone: {zone}")
+            if monitor_after and log_path == self.log_path:
+                file_size = os.path.getsize(log_path)
+                self.parser.reset()
+                self.parser.set_log_date(datetime.fromtimestamp(os.path.getmtime(log_path)).strftime('%Y-%m-%d'))
+                self.parser.current_character = self.current_character
+                self.parser.current_zone = ZoneInfo(zone, datetime.now(), char) if zone and char else None
+                if char:
+                    zid = self.data_store.get_current_zone_id(char)
+                    if zid: self.parser.current_zone_id = self.current_zone_id = zid
+                self.monitor = LogMonitor(log_path, self.parser); self.monitor.start(from_position=file_size)
+                self.monitoring_active = True
+                self.monitor_btn.config(text="⏹ Stop Monitoring"); self.status_label.config(text="Status: Monitoring", foreground='green')
+                self._add_feed_line("Now monitoring for new data...", 'character')
+            else: self.status_label.config(text="Status: Idle", foreground='red')
+            self._refresh_all()
+        else: self._add_feed_line(msg, 'error'); self.status_label.config(text="Status: Error", foreground='red')
+
+    def _import_log_file(self):
+        fp = filedialog.askopenfilename(title="Import Log File", filetypes=[("Log files","*.log"),("All files","*.*")])
+        if fp: self._load_file_background(fp, monitor_after=False)
+
+    def _toggle_monitoring(self):
+        if self.monitoring_active: self._stop_monitoring()
+        else: self._start_monitoring()
+
+    def _start_monitoring(self):
+        if not os.path.exists(self.log_path): messagebox.showerror("Error", f"Log file not found:\n{self.log_path}"); return
+        log_date = datetime.fromtimestamp(os.path.getmtime(self.log_path)).strftime('%Y-%m-%d')
+        self.log_date_label.config(text=f"Log Date: {log_date}"); self.parser.set_log_date(log_date)
+        if self.current_character:
+            self.parser.current_character = self.current_character
+            zid = self.data_store.get_current_zone_id(self.current_character)
+            if zid: self.parser.current_zone_id = self.current_zone_id = zid
+            if self.current_zone: self.parser.current_zone = ZoneInfo(self.current_zone, datetime.now(), self.current_character)
+        self.monitor = LogMonitor(self.log_path, self.parser)
+        self.monitor.start(from_position=os.path.getsize(self.log_path))
+        self.monitoring_active = True
+        self.monitor_btn.config(text="⏹ Stop Monitoring"); self.status_label.config(text="Status: Monitoring", foreground='green')
+        self._add_feed_line(f"Monitoring: {self.log_path}", 'character')
+
+    def _stop_monitoring(self):
+        if self.monitor: self.monitor.stop(); self.monitor = None
+        self.monitoring_active = False
+        self.monitor_btn.config(text="▶ Start Monitoring"); self.status_label.config(text="Status: Idle", foreground='red')
+        self._add_feed_line("Monitoring stopped", 'error')
+
+    def _start_event_processor(self):
+        def process():
+            try:
+                while True:
+                    evt = self.event_queue.get_nowait()
+                    if evt[0] == 'character':
+                        self.current_character = evt[1]; self.char_label.config(text=f"Character: {evt[1]}")
+                        self._add_feed_line(f"Character: {evt[1]}", 'character')
+                    elif evt[0] == 'zone':
+                        self.current_zone, ts = evt[1], evt[2]
+                        self.current_zone_id = self.parser.current_zone_id
+                        self.zone_label.config(text=f"Zone: {evt[1]}")
+                        self._add_feed_line(f"[{self._format_time(ts)}] Zone: {evt[1]}", 'zone')
+                        self._refresh_zones()
+                    elif evt[0] == 'damage':
+                        e = evt[1]; total = e.health_dmg + e.armor_dmg
+                        self._add_feed_line(f"[{self._format_time(e.timestamp)}] {e.player_name}: {total:,} dmg → {e.npc_name}", 'damage')
+                        if self.mini_window: self._update_mini()
+                    elif evt[0] == 'error': self._add_feed_line(f"Error: {evt[1]}", 'error')
+            except queue.Empty: pass
+            self.root.after(100, process)
+        self.root.after(100, process)
+
+    def _add_feed_line(self, text: str, tag: str = None):
+        self.feed_text.config(state='normal'); self.feed_text.insert('end', text + '\n', tag)
+        self.feed_text.see('end'); self.feed_text.config(state='disabled')
+        if int(self.feed_text.index('end-1c').split('.')[0]) > 1000:
+            self.feed_text.config(state='normal'); self.feed_text.delete('1.0', '500.0'); self.feed_text.config(state='disabled')
+
+    def _start_auto_refresh(self):
+        self._refresh_counter = 0
+        def refresh():
+            if not self.loading_active:
+                self._refresh_counter += 1
+                if self.monitoring_active and self._refresh_counter >= 5: self._refresh_counter = 0; self._refresh_zones()
+                self._refresh_rolling()
+                if self.mini_window: self._update_mini()
+            self.root.after(10000, refresh)
+        self.root.after(10000, refresh)
+
+    def _refresh_all(self):
+        self._refresh_rolling(); self._refresh_zones(); self._refresh_monsters(); self._refresh_aliases()
+        self.tz_label.config(text=f"TZ: {self.timezone_var.get()}")
+
+    def _populate_damage_tree(self, tree, data, combat_duration, info_label=None, info_text=""):
+        for item in tree.get_children(): tree.delete(item)
+        if info_label: info_label.config(text=info_text)
+        if not data: return
+        total_dmg = sum(d['total_dmg'] for d in data)
+        for d in data:
+            dps = d['total_dmg'] / combat_duration if combat_duration > 0 else 0
+            pct = (d['total_dmg'] / total_dmg * 100) if total_dmg > 0 else 0
+            tree.insert('', 'end', values=(d['display_name'], f"{d['health_dmg']:,}", f"{d['armor_dmg']:,}",
+                f"{d['total_dmg']:,}", f"{d.get('weighted_aggro', 0):,}", f"{dps:.1f}", f"{pct:.1f}%", d['kills']))
+
+    def _refresh_rolling(self):
+        latest = self.data_store.get_latest_damage_timestamp()
+        if not latest: self._populate_damage_tree(self.rolling_tree, [], 1, self.rolling_info, "No damage data"); return
+        try: minutes = float(self.window_var.get())
+        except: minutes = 5
+        data = group_damage_by_alias(self.data_store.get_damage_in_time_range(latest - timedelta(minutes=minutes), latest))
+        if not data: self._populate_damage_tree(self.rolling_tree, [], 1, self.rolling_info, f"No damage in last {minutes:.0f} min"); return
+        first_hits = [d['first_hit'] for d in data if d['first_hit']]
+        last_hits = [d['last_hit'] for d in data if d['last_hit']]
+        if first_hits and last_hits:
+            combat = max((max(last_hits) - min(first_hits)).total_seconds(), 1)
+            time_range = f"{self._format_time(min(first_hits))} - {self._format_time(max(last_hits))}"
+        else: combat = minutes * 60; time_range = "N/A"
+        total = sum(d['total_dmg'] for d in data)
+        self._populate_damage_tree(self.rolling_tree, data, combat, self.rolling_info, f"Time: {time_range} | Combat: {combat:.0f}s | Total: {total:,}")
+
+    def _refresh_zones(self):
+        saved = set(self.zones_tree.selection())
+        for item in self.zones_tree.get_children(): self.zones_tree.delete(item)
+        try: min_wis = int(self.min_wisdom_var.get() or 0)
+        except: min_wis = 0
+        for inst in self.data_store.get_all_zone_instances():
+            stats = self.data_store.get_zone_stats(inst['zone_id'])
+            if min_wis > stats['wisdom']: continue
+            left = self._format_time(inst['left_time']) if inst['left_time'] else "(current)"
+            self.zones_tree.insert('', 'end', iid=str(inst['zone_id']), values=(inst['name'], inst['character_name'],
+                inst['log_date'] or "--", self._format_time(inst['entered_time']), left, f"{stats['wisdom']:,}", stats['kills'], f"{stats['total_dmg']:,}"))
+        for iid in saved:
+            if self.zones_tree.exists(iid): self.zones_tree.selection_add(iid)
+
+    def _update_session(self):
+        sel = self.zones_tree.selection()
+        for item in self.session_tree.get_children(): self.session_tree.delete(item)
+        if not sel: self.selected_label.config(text="No zones selected"); return
+        zone_ids = [int(s) for s in sel]
+        data = group_damage_by_alias(self.data_store.get_damage_by_zones(zone_ids))
+        if not data: self.selected_label.config(text=f"{len(zone_ids)} zone(s) selected - No damage data"); return
+        first, last, kills = self.data_store.get_zones_combat_times(zone_ids)
+        combat = max((last - first).total_seconds(), 1) if first and last else 1
+        total = sum(d['total_dmg'] for d in data)
+        self.selected_label.config(text=f"{len(zone_ids)} zone(s) | Combat: {combat:.0f}s | Kills: {kills} | Total: {total:,}")
+        self._populate_damage_tree(self.session_tree, data, combat)
+
+    def _copy_zones(self, compact: bool):
+        sel = self.zones_tree.selection()
+        if not sel: self._add_feed_line("Nothing selected", 'error'); return
+        zone_ids = [int(s) for s in sel]
+        data = group_damage_by_alias(self.data_store.get_damage_by_zones(zone_ids))
+        total = sum(d['total_dmg'] for d in data)
+        first, last, _ = self.data_store.get_zones_combat_times(zone_ids)
+        combat = (last - first).total_seconds() if first and last else 1
+        if compact:
+            lines = [f"{d['display_name'][:8]}: {format_damage_short(d['total_dmg'])} {format_damage_short(int(d['total_dmg']/combat))}/s {d['total_dmg']/total*100 if total else 0:.0f}%" for d in data]
+        else:
+            lines = ["Player\tHealth\tArmor\tTotal\tAggro Est\tDPS\t%\tKills"]
+            for d in data:
+                dps = d['total_dmg'] / combat; pct = d['total_dmg'] / total * 100 if total else 0
+                lines.append(f"{d['display_name']}\t{d['health_dmg']:,}\t{d['armor_dmg']:,}\t{d['total_dmg']:,}\t{d.get('weighted_aggro', 0):,}\t{dps:.1f}\t{pct:.1f}%\t{d['kills']}")
+        self.root.clipboard_clear(); self.root.clipboard_append('\n'.join(lines))
+
+    def _refresh_aliases(self):
+        for item in self.alias_tree.get_children(): self.alias_tree.delete(item)
+        filt = self.alias_filter_var.get().strip() or None
+        for pid, name, alias in self.data_store.get_all_players(filter_text=filt):
+            self.alias_tree.insert('', 'end', iid=str(pid), values=(name, alias or "(no alias)"))
+
+    def _refresh_monsters(self):
+        """Refresh the monster tab zone list (uses shared min_wisdom_var)."""
+        saved = set(self.monster_zones_tree.selection())
+        for item in self.monster_zones_tree.get_children(): self.monster_zones_tree.delete(item)
+        try: min_wis = int(self.min_wisdom_var.get() or 0)
+        except: min_wis = 0
+        for inst in self.data_store.get_all_zone_instances():
+            stats = self.data_store.get_zone_stats(inst['zone_id'])
+            if min_wis > stats['wisdom']: continue
+            left = self._format_time(inst['left_time']) if inst['left_time'] else "(current)"
+            self.monster_zones_tree.insert('', 'end', iid=str(inst['zone_id']), values=(inst['name'], inst['character_name'],
+                inst['log_date'] or "--", self._format_time(inst['entered_time']), left, f"{stats['wisdom']:,}", stats['kills'], f"{stats['total_dmg']:,}"))
+        for iid in saved:
+            if self.monster_zones_tree.exists(iid): self.monster_zones_tree.selection_add(iid)
+        # Refresh monster list
+        self._update_monster_list()
+
+    def _refresh_zones_and_monsters(self):
+        """Refresh both Zone Runs and Monsters tabs (shared filter)."""
+        self._refresh_zones()
+        self._refresh_monsters()
+
+    def _update_monster_list(self):
+        """Update the monster list based on selected zones and filter."""
+        # Clear existing items
+        for item in self.monster_tree.get_children(): self.monster_tree.delete(item)
+        
+        sel = self.monster_zones_tree.selection()
+        if not sel:
+            self.monster_summary_label.config(text="No zones selected")
             return
         
-        try:
-            now = datetime.now()
-            for widget in self.scrollable_frame.winfo_children():
-                if hasattr(widget, 'time_label') and widget.time_label.winfo_exists():
-                    vname = widget.vendor_name
-                    vendor = next((x for x in self.vendors if x.name == vname), None)
-                    if vendor:
-                        time_diff = vendor.next_reset - now
-                        if time_diff.total_seconds() > 0:
-                            time_obj = TimeUntilReset.from_timedelta(time_diff)
-                            widget.time_label.config(text=time_obj.to_string(), font=("Arial", 10, "normal"))
-                        else:
-                            time_str = "RESET PENDING!"
-                            font_style = "bold" if self.flash_phase else "normal"
-                            widget.time_label.config(text=time_str, font=("Arial", 10, font_style))
-            
-            self.flash_phase = not self.flash_phase
-        except Exception as e:
-            print(f"Error updating timers: {e}")
+        zone_ids = [int(s) for s in sel]
+        filter_text = self.monster_name_filter_var.get().strip() or None
         
-        self.after(TIMER_UPDATE_MS, self._update_timers)
-    
-    def _show_error(self, message: str, parent=None):
-        """Show error message."""
-        if parent is None:
-            parent = self
-        messagebox.showerror("Error", message, parent=parent)
-    
-    def on_closing(self):
-        """Handle window close."""
+        data = self.data_store.get_monster_summary_by_zones(zone_ids, filter_text)
+        if not data:
+            self.monster_summary_label.config(text=f"{len(zone_ids)} zone(s) selected - No monster data")
+            return
+        
+        total_dmg = sum(d['total_dmg'] for d in data)
+        total_kills = sum(d['kill_count'] for d in data)
+        self.monster_summary_label.config(text=f"{len(zone_ids)} zone(s) | {len(data)} monster types | {total_kills} kills | {total_dmg:,} total damage")
+        
+        # Populate monster tree with new columns
+        for d in data:
+            iid = self.monster_tree.insert('', 'end', text='', values=(
+                d['npc_name'],
+                f"{d['health_dmg']:,}",
+                f"{d['armor_dmg']:,}",
+                f"{d['total_dmg']:,}",
+                '--',  # Aggro Est will be shown in expanded player view
+                d['kill_count']
+            ))
+            # Add a dummy child to make it expandable
+            self.monster_tree.insert(iid, 'end', text='_placeholder_', values=('','','','','',''))
+
+    def _on_monster_expand(self, event):
+        """Load player damage breakdown when a monster item is expanded."""
+        item = self.monster_tree.focus()
+        if not item:
+            return
+        
+        # Get monster name from the item
+        values = self.monster_tree.item(item, 'values')
+        if not values:
+            return
+        npc_name = values[0]
+        
+        # Check if already loaded (first child text is not placeholder)
+        children = self.monster_tree.get_children(item)
+        if children:
+            first_child_text = self.monster_tree.item(children[0], 'text')
+            if first_child_text != '_placeholder_':
+                return  # Already loaded
+        
+        # Remove the dummy child
+        for child in children:
+            self.monster_tree.delete(child)
+        
+        # Get zone selection
+        sel = self.monster_zones_tree.selection()
+        if not sel:
+            return
+        zone_ids = [int(s) for s in sel]
+        
+        # Get player damage summary for this monster
+        players = self.data_store.get_monster_player_summary(zone_ids, npc_name)
+        
+        if not players:
+            self.monster_tree.insert(item, 'end', text='', values=('No player data','','','','',''))
+            return
+        
+        # Calculate total for percentage
+        total_dmg = sum(p['total_dmg'] for p in players)
+        
+        # Add each player as a child
+        for p in players:
+            pct = (p['total_dmg'] / total_dmg * 100) if total_dmg > 0 else 0
+            self.monster_tree.insert(item, 'end', text='', values=(
+                f"  {p['display_name']}",
+                f"{p['health_dmg']:,}",
+                f"{p['armor_dmg']:,}",
+                f"{p['total_dmg']:,} ({pct:.1f}%)",
+                f"{p['weighted_aggro']:,}",
+                p['kills']
+            ))
+
+    def _edit_alias(self, event):
+        sel = self.alias_tree.selection()
+        if not sel: return
+        pid = int(sel[0]); vals = self.alias_tree.item(sel[0], 'values')
+        cur = vals[1] if vals[1] != "(no alias)" else ""
+        new = simpledialog.askstring("Edit Alias", f"Enter alias for '{vals[0]}':\n(Leave blank to remove)", initialvalue=cur)
+        if new is not None:
+            self.data_store.update_player_alias(pid, new)
+            self._refresh_aliases(); self._refresh_rolling(); self._update_session()
+
+    def _export_csv(self):
+        sel = self.zones_tree.selection()
+        if sel: zone_ids = [int(s) for s in sel]; default = f"damage_zones_{len(zone_ids)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        else:
+            insts = self.data_store.get_all_zone_instances()
+            zone_ids = [z['zone_id'] for z in insts]; default = f"damage_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        data = group_damage_by_alias(self.data_store.get_damage_by_zones(zone_ids)) if zone_ids else []
+        fp = filedialog.asksaveasfilename(title="Export", defaultextension=".csv", filetypes=[("CSV","*.csv")], initialfile=default)
+        if not fp: return
         try:
-            self.timer_running = False
-            self.auto_scan_enabled = False
-            self.db.save_vendors(self.vendors, self.current_character)
-        except Exception as e:
-            print(f"Error saving on close: {e}")
-        finally:
-            self.destroy()
+            with open(fp, 'w') as f:
+                f.write("Player,Health Damage,Armor Damage,Total Damage,Aggro Est,Kills\n")
+                for d in data: f.write(f"{d['display_name']},{d['health_dmg']},{d['armor_dmg']},{d['total_dmg']},{d.get('weighted_aggro', 0)},{d['kills']}\n")
+            messagebox.showinfo("Export Complete", f"Data exported to:\n{fp}")
+        except Exception as e: messagebox.showerror("Export Error", str(e))
+
+    def _clear_all_data(self):
+        if messagebox.askyesno("Clear All Data", "Clear all damage data?\n(Aliases preserved)"):
+            self.data_store.clear_all_data(); self._add_feed_line("All data cleared", 'error'); self._refresh_all()
+
+    def _open_mini_window(self):
+        if self.mini_window: self.mini_window.lift(); return
+        self.mini_window = tk.Toplevel(self.root); self.mini_window.title("AnatomyDPS - Compact")
+        self.mini_window.geometry("400x300"); self.mini_window.attributes('-topmost', True)
+        self.mini_window.protocol("WM_DELETE_WINDOW", self._close_mini)
+        self.mini_view_mode = tk.StringVar(value='zone')
+        header = ttk.Frame(self.mini_window); header.pack(fill='x', padx=5, pady=5)
+        ttk.Radiobutton(header, text="Current Zone", variable=self.mini_view_mode, value='zone', command=self._update_mini).pack(side='left', padx=2)
+        ttk.Radiobutton(header, text="Last 5 Min", variable=self.mini_view_mode, value='5min', command=self._update_mini).pack(side='left', padx=2)
+        self.mini_info = ttk.Label(self.mini_window, text="--"); self.mini_info.pack(fill='x', padx=5)
+        self.mini_tree = create_treeview(self.mini_window, ('Player','Damage','DPS','%'), [150,80,70,60], height=10)
+        scroll = ttk.Scrollbar(self.mini_window, orient='vertical', command=self.mini_tree.yview)
+        self.mini_tree.configure(yscrollcommand=scroll.set)
+        self.mini_tree.pack(side='left', fill='both', expand=True, padx=(5,0), pady=5); scroll.pack(side='right', fill='y', padx=(0,5), pady=5)
+        self._update_mini()
+
+    def _close_mini(self):
+        if self.mini_window: self.mini_window.destroy(); self.mini_window = None
+
+    def _update_mini(self):
+        if not self.mini_window: return
+        for item in self.mini_tree.get_children(): self.mini_tree.delete(item)
+        if self.mini_view_mode.get() == 'zone':
+            if not self.current_character: self.mini_info.config(text="No character"); return
+            zid = self.data_store.get_current_zone_id(self.current_character)
+            if not zid: self.mini_info.config(text="No active zone"); return
+            data = group_damage_by_alias(self.data_store.get_damage_by_zones([zid]))
+            if not data: self.mini_info.config(text=f"Zone: {self.current_zone or '--'} | No damage"); return
+            first, last, kills = self.data_store.get_zones_combat_times([zid])
+            combat = max((last - first).total_seconds(), 1) if first and last and kills > 0 else 1
+            zone_name = (self.current_zone or '--')[:17] + "..." if len(self.current_zone or '--') > 20 else (self.current_zone or '--')
+            total = sum(d['total_dmg'] for d in data)
+            self.mini_info.config(text=f"{zone_name} | {kills} kills | {total:,} dmg | {combat:.0f}s")
+        else:
+            latest = self.data_store.get_latest_damage_timestamp()
+            if not latest: self.mini_info.config(text="No damage data"); return
+            data = group_damage_by_alias(self.data_store.get_damage_in_time_range(latest - timedelta(minutes=5), latest))
+            if not data: self.mini_info.config(text="No damage in last 5 min"); return
+            first_hits = [d['first_hit'] for d in data if d['first_hit']]
+            last_hits = [d['last_hit'] for d in data if d['last_hit']]
+            combat = max((max(last_hits) - min(first_hits)).total_seconds(), 1) if first_hits and last_hits else 300
+            total = sum(d['total_dmg'] for d in data)
+            self.mini_info.config(text=f"Last 5 min | {total:,} dmg | {combat:.0f}s")
+        for d in data:
+            dps = d['total_dmg'] / combat if combat > 0 else 0
+            pct = (d['total_dmg'] / total * 100) if total > 0 else 0
+            self.mini_tree.insert('', 'end', values=(d['display_name'], f"{d['total_dmg']:,}", f"{dps:.0f}", f"{pct:.1f}%"))
+
+    def _on_close(self):
+        self._stop_monitoring()
+        if self.loader: self.loader.cancel()
+        self._close_mini(); self.root.destroy()
+
+    def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close); self.root.mainloop()
 
 
-# ---------------------
-# Launch
-# ---------------------
-if __name__ == "__main__":
-    try:
-        app = VendorApp()
-        app.mainloop()
-    except Exception as e:
-        print(f"Fatal error: {e}")
-        sys.exit(1)
+if __name__ == '__main__':
+    import sys
+    app = DamageParserGUI(sys.argv[1] if len(sys.argv) > 1 else None)
+    app.run()
